@@ -38,3 +38,6 @@ desktop.ini
 
 # 日志
 *.log
+
+# PyInstaller打包产物
+*.spec

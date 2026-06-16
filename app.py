@@ -20,7 +20,7 @@ from PyQt5.QtWidgets import (
     QHeaderView, QSizePolicy, QInputDialog, QStackedWidget,
 )
 from PyQt5.QtCore import Qt, QTimer, QRectF
-from PyQt5.QtGui import QFont, QColor, QPalette, QPainter, QImage, QVector3D
+from PyQt5.QtGui import QFont, QColor, QPalette, QPainter, QImage, QVector3D, QIcon
 
 import pyqtgraph as pg
 from pyqtgraph import PlotWidget, PlotCurveItem, ScatterPlotItem, ImageItem, ColorBarItem
@@ -3362,8 +3362,13 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("势能面搜索算法交互式可视化教学工具")
+        self.setWindowTitle("势能面搜索算法交互式可视化教学工具 — TFAA@2026")
         self.resize(1400, 900)
+
+        # 设置窗口图标
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pesvisualizerlogo.png')
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
 
         # 状态变量
         self.pes = None
