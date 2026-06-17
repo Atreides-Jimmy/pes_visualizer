@@ -12,7 +12,7 @@ python_exe = sys.executable
 cmd = [
     python_exe, "-m", "PyInstaller",
     "--noconfirm",
-    "--onedir",
+    "--onefile",
     "--windowed",
     "--name", "PES_Visualizer",
     "--icon", "pesvisualizerlogo.png",
@@ -69,7 +69,7 @@ proc.wait()
 print(f"\nPyInstaller exited with code: {proc.returncode}")
 
 if proc.returncode == 0:
-    exe_path = os.path.join("dist", "PES_Visualizer", "PES_Visualizer.exe")
+    exe_path = os.path.join("dist", "PES_Visualizer.exe")
     if os.path.exists(exe_path):
         print(f"SUCCESS: {exe_path} created!")
     else:

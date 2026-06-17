@@ -17,7 +17,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QCheckBox, QRadioButton, QButtonGroup,
     QLineEdit, QTextBrowser, QSplitter,
     QFileDialog, QMessageBox, QTableWidget, QTableWidgetItem,
-    QHeaderView, QSizePolicy, QInputDialog, QStackedWidget,
+    QHeaderView, QSizePolicy, QInputDialog, QStackedWidget, QSlider,
 )
 from PyQt5.QtCore import Qt, QTimer, QRectF
 from PyQt5.QtGui import QFont, QColor, QPalette, QPainter, QImage, QVector3D, QIcon
@@ -405,6 +405,7 @@ class PESCanvas(QWidget):
         self._original_bounds = None
         self._bias_function = None  # 偏置势函数（用于SSW/MetaDynamics可视化）
         self._Z_original = None  # 无偏置的原始Z数据
+        self._reset_camera_center = False  # 是否重置3D相机中心到新PES中心
 
         # 当前布局状态
         self._current_layout = None  # 'contour', 'contour+energy', '3d', '3d+energy'
@@ -475,6 +476,11 @@ class PESCanvas(QWidget):
             self._gl_widget.setBackgroundColor('#1a1b2e')
             self._gl_widget.setCameraPosition(distance=20, elevation=30, azimuth=45)
             layout_3d.addWidget(self._gl_widget)
+            # 平移偏移（相机空间，世界单位），用于右键拖拽平移
+            # 通过覆盖viewMatrix实现，保持opts['center']不变，旋转中心始终在PES中心
+            self._pan_offset = np.array([0.0, 0.0, 0.0])
+            self._original_view_matrix = self._gl_widget.viewMatrix
+            self._gl_widget.viewMatrix = self._pan_view_matrix
         else:
             # 没有OpenGL时显示提示
             label = QLabel("3D视图需要PyOpenGL支持，请安装: pip install PyOpenGL")
@@ -502,6 +508,8 @@ class PESCanvas(QWidget):
         if self._gl_widget is not None:
             self._gl_widget.mousePressEvent = self._make_3d_click_handler(self._gl_widget.mousePressEvent)
             self._gl_widget.mouseReleaseEvent = self._on_3d_mouse_release
+            # 右键拖拽平移势能面（连同坐标轴）
+            self._gl_widget.mouseMoveEvent = self._make_3d_move_handler(self._gl_widget.mouseMoveEvent)
 
         # 存储当前绘图项引用，用于清除和重建
         self._contour_items = []
@@ -527,6 +535,65 @@ class PESCanvas(QWidget):
                 return
             # 记录按下位置，在release时判断是否为单击
             self._3d_press_pos = ev.pos()
+        return handler
+
+    def _pan_view_matrix(self):
+        """覆盖GLViewWidget的viewMatrix，在相机空间应用平移偏移
+
+        保持opts['center']不变（旋转中心始终在PES中心），
+        平移在相机空间应用（在距离平移之后、旋转之前），
+        这样平移方向始终与屏幕/鼠标方向一致，与势能面旋转角度无关。
+        """
+        from PyQt5.QtGui import QMatrix4x4
+        tr = QMatrix4x4()
+        gl = self._gl_widget
+        # 1. 距离平移（相机后退）
+        tr.translate(0.0, 0.0, -gl.opts['distance'])
+        # 2. 相机空间平移偏移（屏幕空间：+X右，+Y上）
+        #    在旋转之前应用，确保平移方向与屏幕一致，不受旋转影响
+        #    鼠标右移(dx>0)→pan_offset[0]增大→场景右移→translate(+pan_x)
+        #    鼠标上移(dy>0)→pan_offset[1]增大→场景上移→translate(-pan_y)（Y轴翻转）
+        tr.translate(self._pan_offset[0], -self._pan_offset[1], 0)
+        # 3. 旋转
+        if gl.opts['rotationMethod'] == 'quaternion':
+            tr.rotate(gl.opts['rotation'])
+        else:
+            tr.rotate(gl.opts['elevation']-90, 1, 0, 0)
+            tr.rotate(gl.opts['azimuth']+90, 0, 0, -1)
+        # 4. 平移到中心（旋转中心，保持PES中心为旋转锚点）
+        center = gl.opts['center']
+        tr.translate(-center.x(), -center.y(), -center.z())
+        return tr
+
+    def _make_3d_move_handler(self, original_move_handler):
+        """创建3D视图的鼠标移动处理器，支持右键拖拽平移势能面（连同坐标轴）
+
+        右键按住后移动：通过viewMatrix偏移平移视图，旋转中心始终在PES中心
+        平移方向始终与鼠标移动方向一致，与势能面旋转角度无关
+        其他情况：调用原始处理器（左键旋转等）
+        """
+        def handler(ev):
+            if ev.buttons() & Qt.RightButton:
+                # 右键拖拽：平移
+                lpos = ev.position() if hasattr(ev, 'position') else ev.localPos()
+                if not hasattr(self._gl_widget, 'mousePos'):
+                    self._gl_widget.mousePos = lpos
+                diff = lpos - self._gl_widget.mousePos
+                self._gl_widget.mousePos = lpos
+                # 计算像素到世界单位的转换因子（与pyqtgraph的pan一致）
+                gl = self._gl_widget
+                from math import tan, radians
+                dist = (gl.opts['center'] - gl.cameraPosition()).length()
+                fov_factor = tan(radians(gl.opts['fov']) / 2) * 2
+                scale_factor = dist * fov_factor / gl.width()
+                # 累积平移偏移（相机空间：+X右，+Y上；屏幕：+X右，+Y下）
+                # 鼠标右移(dx>0)→场景右移→相机左移→viewMatrix translate +X→pan_offset_x += scale*dx
+                self._pan_offset[0] += scale_factor * diff.x()
+                self._pan_offset[1] += scale_factor * diff.y()
+                gl.update()
+            else:
+                # 调用原始处理器（左键旋转等）
+                original_move_handler(ev)
         return handler
 
     def _on_3d_mouse_release(self, ev):
@@ -840,7 +907,7 @@ class PESCanvas(QWidget):
     def _restore_camera_state(self, cam_state):
         """恢复3D相机状态"""
         if cam_state is None or self._gl_widget is None:
-            # 首次显示时自动计算合适的相机距离
+            # 首次显示或范围变化时自动计算合适的相机参数
             try:
                 if self.X is not None and self.Z is not None:
                     x_range = self.X.max() - self.X.min()
@@ -851,6 +918,12 @@ class PESCanvas(QWidget):
                     z_min_scaled = 0
                     z_range_scaled = z_max_scaled - z_min_scaled
                     avg_range = max(x_range, y_range, z_range_scaled)
+                    # 重置相机中心到新PES的几何中心，保证旋转围绕当前图样中心
+                    center_x = (self.X.min() + self.X.max()) / 2.0
+                    center_y = (self.Y.min() + self.Y.max()) / 2.0
+                    center_z = z_range_scaled / 2.0
+                    from PyQt5.QtGui import QVector3D
+                    self._gl_widget.opts['center'] = QVector3D(center_x, center_y, center_z)
                     self._gl_widget.setCameraPosition(
                         distance=avg_range * 2.0, elevation=30, azimuth=45)
             except Exception:
@@ -1386,7 +1459,12 @@ class PESCanvas(QWidget):
         new_layout = '3d+energy' if energy_profile is not None else '3d'
 
         # ★ 保存相机状态（在清除绘图项之前）
-        cam_state = self._save_camera_state()
+        # 如果范围变化需要重置相机中心，则不保存旧中心
+        if getattr(self, '_reset_camera_center', False):
+            cam_state = None
+            self._reset_camera_center = False
+        else:
+            cam_state = self._save_camera_state()
 
         # 清除旧绘图项
         self._clear_3d_items()
@@ -1711,6 +1789,18 @@ class ControlPanel(QWidget):
         range_x_layout.addWidget(self.x_max_spin)
         pes_layout.addLayout(range_x_layout)
 
+        # x范围滑块
+        self.x_min_slider = QSlider(Qt.Horizontal)
+        self.x_min_slider.setRange(-10000, 10000)
+        self.x_min_slider.setValue(int(-1.5 * 100))
+        self.x_max_slider = QSlider(Qt.Horizontal)
+        self.x_max_slider.setRange(-10000, 10000)
+        self.x_max_slider.setValue(int(1.5 * 100))
+        x_slider_layout = QHBoxLayout()
+        x_slider_layout.addWidget(self.x_min_slider)
+        x_slider_layout.addWidget(self.x_max_slider)
+        pes_layout.addLayout(x_slider_layout)
+
         range_y_layout = QHBoxLayout()
         range_y_layout.addWidget(QLabel("y:"))
         self.y_min_spin = QDoubleSpinBox()
@@ -1727,6 +1817,28 @@ class ControlPanel(QWidget):
         range_y_layout.addWidget(QLabel("~"))
         range_y_layout.addWidget(self.y_max_spin)
         pes_layout.addLayout(range_y_layout)
+
+        # y范围滑块
+        self.y_min_slider = QSlider(Qt.Horizontal)
+        self.y_min_slider.setRange(-10000, 10000)
+        self.y_min_slider.setValue(int(-0.5 * 100))
+        self.y_max_slider = QSlider(Qt.Horizontal)
+        self.y_max_slider.setRange(-10000, 10000)
+        self.y_max_slider.setValue(int(2.5 * 100))
+        y_slider_layout = QHBoxLayout()
+        y_slider_layout.addWidget(self.y_min_slider)
+        y_slider_layout.addWidget(self.y_max_slider)
+        pes_layout.addLayout(y_slider_layout)
+
+        # 滑块与spinbox双向同步
+        self.x_min_slider.valueChanged.connect(lambda v: self.x_min_spin.setValue(v / 100.0))
+        self.x_max_slider.valueChanged.connect(lambda v: self.x_max_spin.setValue(v / 100.0))
+        self.y_min_slider.valueChanged.connect(lambda v: self.y_min_spin.setValue(v / 100.0))
+        self.y_max_slider.valueChanged.connect(lambda v: self.y_max_spin.setValue(v / 100.0))
+        self.x_min_spin.valueChanged.connect(lambda v: self.x_min_slider.setValue(int(v * 100)))
+        self.x_max_spin.valueChanged.connect(lambda v: self.x_max_slider.setValue(int(v * 100)))
+        self.y_min_spin.valueChanged.connect(lambda v: self.y_min_slider.setValue(int(v * 100)))
+        self.y_max_spin.valueChanged.connect(lambda v: self.y_max_slider.setValue(int(v * 100)))
 
         self.apply_range_btn = QPushButton("应用范围")
         self.apply_range_btn.setObjectName("applyRangeBtn")
@@ -2353,7 +2465,7 @@ class ControlPanel(QWidget):
         us_ss_layout.addWidget(QLabel("MC步长:"))
         self.us_mc_step_size = QDoubleSpinBox()
         self.us_mc_step_size.setRange(0.01, 2.0)
-        self.us_mc_step_size.setValue(0.1)
+        self.us_mc_step_size.setValue(0.3)
         self.us_mc_step_size.setDecimals(2)
         self.us_mc_step_size.setSingleStep(0.01)
         us_ss_layout.addWidget(self.us_mc_step_size)
@@ -2362,8 +2474,8 @@ class ControlPanel(QWidget):
         us_temp_layout = QHBoxLayout()
         us_temp_layout.addWidget(QLabel("MC温度:"))
         self.us_mc_temperature = QDoubleSpinBox()
-        self.us_mc_temperature.setRange(0.01, 100.0)
-        self.us_mc_temperature.setValue(1.0)
+        self.us_mc_temperature.setRange(0.01, 1000.0)
+        self.us_mc_temperature.setValue(50.0)
         self.us_mc_temperature.setDecimals(2)
         self.us_mc_temperature.setSingleStep(0.1)
         us_temp_layout.addWidget(self.us_mc_temperature)
@@ -2412,7 +2524,7 @@ class ControlPanel(QWidget):
         abf_ss_layout.addWidget(QLabel("MC步长:"))
         self.abf_mc_step_size = QDoubleSpinBox()
         self.abf_mc_step_size.setRange(0.01, 2.0)
-        self.abf_mc_step_size.setValue(0.1)
+        self.abf_mc_step_size.setValue(0.3)
         self.abf_mc_step_size.setDecimals(2)
         self.abf_mc_step_size.setSingleStep(0.01)
         abf_ss_layout.addWidget(self.abf_mc_step_size)
@@ -2421,8 +2533,8 @@ class ControlPanel(QWidget):
         abf_temp_layout = QHBoxLayout()
         abf_temp_layout.addWidget(QLabel("MC温度:"))
         self.abf_mc_temperature = QDoubleSpinBox()
-        self.abf_mc_temperature.setRange(0.01, 100.0)
-        self.abf_mc_temperature.setValue(1.0)
+        self.abf_mc_temperature.setRange(0.01, 1000.0)
+        self.abf_mc_temperature.setValue(50.0)
         self.abf_mc_temperature.setDecimals(2)
         self.abf_mc_temperature.setSingleStep(0.1)
         abf_temp_layout.addWidget(self.abf_mc_temperature)
@@ -2752,6 +2864,8 @@ class ControlPanel(QWidget):
         # 更新初始点提示
         if is_neb:
             self.init_hint.setText("请依次点击设置初态和终态")
+            self.init_point2_label.setVisible(True)
+            self.coord2_layout_widget.setVisible(True)
         elif algo in ("伞形采样", "自适应偏置力", "DESW方法"):
             self.init_hint.setText("请依次点击设置起点和终点（反应坐标）")
             self.init_point2_label.setVisible(True)
@@ -2794,6 +2908,11 @@ class ControlPanel(QWidget):
 class InfoPanel(QWidget):
     """下方信息面板：实时物理量、原理说明、关键术语/误区、结果统计并排显示"""
 
+    # 基准高度和基准字号
+    BASE_HEIGHT = 200
+    BASE_FONT_SIZE = 9
+    BASE_TERMS_FONT_SIZE = 10  # 关键术语/误区基础字号（稍大）
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumHeight(150)
@@ -2813,15 +2932,10 @@ class InfoPanel(QWidget):
         physics_layout.setContentsMargins(4, 4, 4, 4)
 
         self.coord_label = QLabel("当前坐标: (-, -)")
-        self.coord_label.setFixedHeight(18)
         self.energy_label = QLabel("当前能量 E: -")
-        self.energy_label.setFixedHeight(18)
         self.grad_norm_label = QLabel("梯度模长 |∇E|: -")
-        self.grad_norm_label.setFixedHeight(18)
         self.eigenvalue_label = QLabel("Hessian本征值: λ₁=-, λ₂=-")
-        self.eigenvalue_label.setFixedHeight(18)
         self.iter_label = QLabel("迭代步数: 0")
-        self.iter_label.setFixedHeight(18)
 
         physics_layout.addWidget(self.coord_label)
         physics_layout.addWidget(self.energy_label)
@@ -2835,13 +2949,9 @@ class InfoPanel(QWidget):
         dimer_layout.setContentsMargins(0, 0, 0, 0)
         dimer_layout.setSpacing(1)
         self.dimer_dir_label = QLabel("双子方向 N̂: -")
-        self.dimer_dir_label.setFixedHeight(18)
         self.dimer_curv_label = QLabel("曲率 C: -")
-        self.dimer_curv_label.setFixedHeight(18)
         self.dimer_fpar_label = QLabel("平行力 |F∥|: -")
-        self.dimer_fpar_label.setFixedHeight(18)
         self.dimer_fperp_label = QLabel("垂直力 |F⊥|: -")
-        self.dimer_fperp_label.setFixedHeight(18)
         dimer_layout.addWidget(self.dimer_dir_label)
         dimer_layout.addWidget(self.dimer_curv_label)
         dimer_layout.addWidget(self.dimer_fpar_label)
@@ -2855,11 +2965,8 @@ class InfoPanel(QWidget):
         neb_info_layout.setContentsMargins(0, 0, 0, 0)
         neb_info_layout.setSpacing(1)
         self.neb_max_e_label = QLabel("路径最高能量点: -")
-        self.neb_max_e_label.setFixedHeight(18)
         self.neb_barrier_label = QLabel("粗略能垒: -")
-        self.neb_barrier_label.setFixedHeight(18)
         self.neb_ci_pos_label = QLabel("CI-NEB过渡态位置: -")
-        self.neb_ci_pos_label.setFixedHeight(18)
         neb_info_layout.addWidget(self.neb_max_e_label)
         neb_info_layout.addWidget(self.neb_barrier_label)
         neb_info_layout.addWidget(self.neb_ci_pos_label)
@@ -2878,10 +2985,9 @@ class InfoPanel(QWidget):
         pes_formula_layout.setContentsMargins(4, 4, 4, 4)
         self.pes_formula_browser = QTextBrowser()
         self.pes_formula_browser.setOpenExternalLinks(False)
-        self.pes_formula_browser.setMaximumHeight(80)
         pes_formula_layout.addWidget(self.pes_formula_browser)
         pes_formula_group.setLayout(pes_formula_layout)
-        main_layout.addWidget(pes_formula_group)
+        main_layout.addWidget(pes_formula_group, stretch=1)
 
         # ---- 算法原理面板 ----
         principle_group = QGroupBox("算法原理")
@@ -2920,11 +3026,8 @@ class InfoPanel(QWidget):
         result_layout.setSpacing(2)
         result_layout.setContentsMargins(4, 4, 4, 4)
         self.result_converge_label = QLabel("收敛步数: -")
-        self.result_converge_label.setFixedHeight(18)
         self.result_energy_label = QLabel("最终能量: -")
-        self.result_energy_label.setFixedHeight(18)
         self.result_type_label = QLabel("收敛类型: -")
-        self.result_type_label.setFixedHeight(18)
         result_layout.addWidget(self.result_converge_label)
         result_layout.addWidget(self.result_energy_label)
         result_layout.addWidget(self.result_type_label)
@@ -2939,12 +3042,60 @@ class InfoPanel(QWidget):
         result_group.setLayout(result_layout)
         main_layout.addWidget(result_group)
 
-    def _get_terms_html(self):
+        # 收集所有需要随高度缩放字体的QLabel
+        self._scaling_labels = [
+            self.coord_label, self.energy_label, self.grad_norm_label,
+            self.eigenvalue_label, self.iter_label,
+            self.dimer_dir_label, self.dimer_curv_label,
+            self.dimer_fpar_label, self.dimer_fperp_label,
+            self.neb_max_e_label, self.neb_barrier_label, self.neb_ci_pos_label,
+            self.result_converge_label, self.result_energy_label, self.result_type_label,
+        ]
+        # 关键术语/误区浏览器（字号稍大）
+        self._terms_browsers = [self.terms_browser, self.mistakes_browser]
+        # 其他文本浏览器（普通缩放）
+        self._other_browsers = [self.pes_formula_browser, self.principle_browser]
+        # 初始应用一次字号
+        self._update_font_sizes()
+
+    def resizeEvent(self, event):
+        """随面板高度变化同比例缩放字体"""
+        super().resizeEvent(event)
+        self._update_font_sizes()
+
+    def _update_font_sizes(self):
+        """根据当前面板高度按比例缩放所有字体"""
+        h = max(self.height(), self.minimumHeight())
+        scale = h / self.BASE_HEIGHT
+        # 普通标签字号
+        font_size = max(7, int(self.BASE_FONT_SIZE * scale))
+        # 关键术语/误区字号（比普通标签大）
+        terms_font_size = max(8, int(self.BASE_TERMS_FONT_SIZE * scale))
+        # 更新普通QLabel
+        font = QFont()
+        font.setPointSize(font_size)
+        for label in self._scaling_labels:
+            label.setFont(font)
+        # 更新关键术语/误区浏览器（字号稍大）
+        terms_font = QFont()
+        terms_font.setPointSize(terms_font_size)
+        for browser in self._terms_browsers:
+            browser.setFont(terms_font)
+        # 更新其他文本浏览器
+        for browser in self._other_browsers:
+            browser.setFont(font)
+        # 重新设置关键术语/误区HTML以应用新的字号样式
+        self.terms_browser.setHtml(self._get_terms_html(terms_font_size))
+        self.mistakes_browser.setHtml(self._get_mistakes_html(terms_font_size))
+
+    def _get_terms_html(self, font_size=None):
         """关键术语解释HTML"""
-        return """
+        if font_size is None:
+            font_size = self.BASE_TERMS_FONT_SIZE
+        return f"""
         <style>
-            dt { font-weight: bold; color: #0066cc; margin-top: 2px; }
-            dd { margin-left: 10px; font-size: 10px; }
+            dt {{ font-weight: bold; color: #0066cc; margin-top: 2px; font-size: {font_size + 1}px; }}
+            dd {{ margin-left: 10px; font-size: {font_size}px; }}
         </style>
         <dl>
         <dt>势能面 (PES)</dt>
@@ -2958,10 +3109,12 @@ class InfoPanel(QWidget):
         </dl>
         """
 
-    def _get_mistakes_html(self):
+    def _get_mistakes_html(self, font_size=None):
         """常见误区HTML"""
-        return """
-        <ul style="font-size:10px; color:#cc3300; margin:2px;">
+        if font_size is None:
+            font_size = self.BASE_TERMS_FONT_SIZE
+        return f"""
+        <ul style="font-size:{font_size}px; color:#cc3300; margin:2px;">
         <li>初始点离鞍点太远，牛顿法会收敛到极小值</li>
         <li>Dimer初始方向错误会找不到过渡态</li>
         <li>NEB镜像点太少会导致路径不光滑</li>
@@ -3549,6 +3702,7 @@ class MainWindow(QMainWindow):
         self.canvas._user_xlim = None
         self.canvas._user_ylim = None
         self.canvas._cbar_ax = None  # 重建布局后colorbar axes也需要重置
+        self.canvas._pan_offset[:] = 0  # 重置3D平移偏移
         self._reset_state()
         self._render_pes()
 
@@ -3594,14 +3748,26 @@ class MainWindow(QMainWindow):
         cp.x_max_spin.blockSignals(True)
         cp.y_min_spin.blockSignals(True)
         cp.y_max_spin.blockSignals(True)
+        cp.x_min_slider.blockSignals(True)
+        cp.x_max_slider.blockSignals(True)
+        cp.y_min_slider.blockSignals(True)
+        cp.y_max_slider.blockSignals(True)
         cp.x_min_spin.setValue(xmin)
         cp.x_max_spin.setValue(xmax)
         cp.y_min_spin.setValue(ymin)
         cp.y_max_spin.setValue(ymax)
+        cp.x_min_slider.setValue(int(xmin * 100))
+        cp.x_max_slider.setValue(int(xmax * 100))
+        cp.y_min_slider.setValue(int(ymin * 100))
+        cp.y_max_slider.setValue(int(ymax * 100))
         cp.x_min_spin.blockSignals(False)
         cp.x_max_spin.blockSignals(False)
         cp.y_min_spin.blockSignals(False)
         cp.y_max_spin.blockSignals(False)
+        cp.x_min_slider.blockSignals(False)
+        cp.x_max_slider.blockSignals(False)
+        cp.y_min_slider.blockSignals(False)
+        cp.y_max_slider.blockSignals(False)
 
     def _apply_range(self):
         """应用用户指定的PES显示范围"""
@@ -3623,8 +3789,11 @@ class MainWindow(QMainWindow):
         self.canvas._user_ylim = None
         self.canvas._current_layout = None  # 强制重建布局
         self.canvas._cbar_ax = None  # 重建布局后colorbar axes也需要重置
-        self._reset_state()
-        self._render_pes()
+        self.canvas._reset_camera_center = True  # 范围变化后重置3D相机中心
+        self.canvas._pan_offset[:] = 0  # 重置平移偏移
+        # 不调用_reset_state()，保留当前轨迹和算法状态
+        self.canvas.compute_grid(self.pes)
+        self._update_view()
 
     def _render_pes(self):
         """渲染势能面"""
@@ -3642,7 +3811,7 @@ class MainWindow(QMainWindow):
         # 准备轨迹数据
         trajectory = self.trajectory if self.trajectory else None
         start_pos = self.start_pos
-        end_pos = self.end_pos if self._is_neb_algo() else None
+        end_pos = self.end_pos if self._needs_two_endpoints() else None
 
         # Dimer/CBD信息
         dimer_info = None
@@ -3704,7 +3873,7 @@ class MainWindow(QMainWindow):
         algo_type = self.control_panel.get_algo_type()
         self.info_panel.update_principle(algo_type)
         # 重置初始点
-        if self._is_neb_algo():
+        if self._needs_two_endpoints():
             self.click_mode = 'start'
         else:
             self.click_mode = 'start'
@@ -3747,14 +3916,18 @@ class MainWindow(QMainWindow):
             self._update_view()
 
     def _is_neb_algo(self):
-        """当前是否为NEB类算法或需要双端点的算法"""
+        """当前是否为NEB类算法（具有images属性的算法）"""
+        return self.control_panel.get_algo_type() in ("NEB方法", "CI-NEB方法")
+
+    def _needs_two_endpoints(self):
+        """当前算法是否需要两个端点（初态+终态）"""
         return self.control_panel.get_algo_type() in ("NEB方法", "CI-NEB方法", "伞形采样", "自适应偏置力", "DESW方法")
 
     def _on_canvas_click(self, x, y):
         """处理画布点击事件"""
         if not self._point_setting_mode:
             return  # 非点设置模式，不处理点击
-        if self._is_neb_algo():
+        if self._needs_two_endpoints():
             if self.click_mode == 'start':
                 self.start_pos = np.array([x, y])
                 self.control_panel.init_x1.setText(f"{x:.4f}")
@@ -3782,7 +3955,7 @@ class MainWindow(QMainWindow):
             y1 = float(self.control_panel.init_y1.text())
             self.start_pos = np.array([x1, y1])
 
-            if self._is_neb_algo():
+            if self._needs_two_endpoints():
                 x2 = float(self.control_panel.init_x2.text())
                 y2 = float(self.control_panel.init_y2.text())
                 self.end_pos = np.array([x2, y2])
@@ -3796,7 +3969,7 @@ class MainWindow(QMainWindow):
         self._point_setting_mode = True
         self.control_panel.set_point_btn.setEnabled(False)
         self.control_panel.finish_point_btn.setEnabled(True)
-        if self._is_neb_algo():
+        if self._needs_two_endpoints():
             self.control_panel.init_hint.setText("请点击设置初态，完成后点'完成'")
             self.click_mode = 'start'
         else:
@@ -4021,7 +4194,7 @@ class MainWindow(QMainWindow):
             if self.algorithm is None:
                 self.algorithm = self._create_algorithm()
                 if self.algorithm is None:
-                    if self._is_neb_algo():
+                    if self._needs_two_endpoints():
                         QMessageBox.warning(self, "提示", "请先设置初始点和终态（在势能面上点击或手动输入）")
                     else:
                         QMessageBox.warning(self, "提示", "请先设置初始点（在势能面上点击或手动输入）")
@@ -4078,7 +4251,7 @@ class MainWindow(QMainWindow):
         if self.algorithm is None:
             self.algorithm = self._create_algorithm()
             if self.algorithm is None:
-                if self._is_neb_algo():
+                if self._needs_two_endpoints():
                     QMessageBox.warning(self, "提示", "请先设置初始点和终态")
                 else:
                     QMessageBox.warning(self, "提示", "请先设置初始点")
@@ -4455,7 +4628,7 @@ class MainWindow(QMainWindow):
 
             # 准备通用参数
             start_pos = self.start_pos
-            end_pos = self.end_pos if self._is_neb_algo() else None
+            end_pos = self.end_pos if self._needs_two_endpoints() else None
             algo_type = self.control_panel.get_algo_type()
 
             # 第一帧：只有初始点

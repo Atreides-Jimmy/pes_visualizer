@@ -1143,8 +1143,8 @@ class SSWMethod:
         bias_center = self.position + direction * self.step_size
         self._gaussians.append((bias_center.copy(), self.gaussian_height, self.gaussian_width))
 
-        # 3. Local optimize on biased PES
-        biased_pos = self._local_optimize_biased(self.position)
+        # 3. Move to bias center (pushed uphill by Gaussian hill)
+        biased_pos = bias_center.copy()
 
         # 4. Remove bias, local optimize on true PES
         new_pos, new_energy = self._local_optimize(biased_pos)
@@ -2737,11 +2737,11 @@ class DESWMethod:
         bias_center = current_pos + direction * self.step_size
         gaussians.append((bias_center.copy(), self.gaussian_height, self.gaussian_width))
 
-        # 3. 在偏置势能面上局部优化
-        new_pos = self._local_optimize_biased(current_pos)
+        # 3. Move to bias center (pushed uphill by Gaussian hill)
+        biased_pos = bias_center.copy()
 
         # 4. 在真实势能面上局部优化
-        new_pos, new_energy = self._local_optimize(new_pos)
+        new_pos, new_energy = self._local_optimize(biased_pos)
 
         # 5. Metropolis接受准则
         old_energy = float(self.pes.energy(current_pos[0], current_pos[1]))
