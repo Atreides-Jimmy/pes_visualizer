@@ -406,6 +406,7 @@ class PESCanvas(QWidget):
         self._bias_function = None  # 偏置势函数（用于SSW/MetaDynamics可视化）
         self._Z_original = None  # 无偏置的原始Z数据
         self._reset_camera_center = False  # 是否重置3D相机中心到新PES中心
+        self._legend_item = None  # 等高线图图例项（确保唯一）
 
         # 当前布局状态
         self._current_layout = None  # 'contour', 'contour+energy', '3d', '3d+energy'
@@ -481,12 +482,25 @@ class PESCanvas(QWidget):
             self._pan_offset = np.array([0.0, 0.0, 0.0])
             self._original_view_matrix = self._gl_widget.viewMatrix
             self._gl_widget.viewMatrix = self._pan_view_matrix
+            # 3D视图右上角半透明图例标签
+            self._3d_legend_label = QLabel(self._gl_widget)
+            self._3d_legend_label.setStyleSheet(
+                "background-color: rgba(255, 255, 255, 180);"
+                "color: #222;"
+                "border: 1px solid rgba(100, 100, 100, 200);"
+                "padding: 4px 6px;"
+                "font-size: 11px;"
+            )
+            self._3d_legend_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+            self._3d_legend_label.setText("")
+            self._3d_legend_label.setVisible(False)
         else:
             # 没有OpenGL时显示提示
             label = QLabel("3D视图需要PyOpenGL支持，请安装: pip install PyOpenGL")
             label.setAlignment(Qt.AlignCenter)
             layout_3d.addWidget(label)
             self._gl_widget = None
+            self._3d_legend_label = None
 
         # 3D能量曲线子图（初始隐藏）
         self._energy_3d_widget = PlotWidget()
@@ -809,6 +823,15 @@ class PESCanvas(QWidget):
         self._user_xlim = tuple(new_xlim)
         self._user_ylim = tuple(new_ylim)
         self._maybe_expand_grid(new_xlim, new_ylim)
+
+    def resizeEvent(self, event):
+        """窗口大小变化时重新定位3D图例标签"""
+        super().resizeEvent(event)
+        if hasattr(self, '_3d_legend_label') and self._3d_legend_label is not None and self._3d_legend_label.isVisible():
+            gw = self._gl_widget.width() if self._gl_widget else self.width()
+            lw = self._3d_legend_label.width()
+            self._3d_legend_label.move(gw - lw - 8, 8)
+            self._3d_legend_label.raise_()
 
     def compute_grid(self, pes, resolution=200):
         """计算势能面网格数据"""
@@ -1421,6 +1444,11 @@ class PESCanvas(QWidget):
         elif hasattr(self, '_original_bounds') and self._original_bounds is not None:
             self._contour_widget.setYRange(self._original_bounds[2], self._original_bounds[3], padding=0)
 
+        # ---- 添加半透明图例（右上角）----
+        self._add_contour_legend(trajectory is not None and len(trajectory) > 0,
+                                  neb_images is not None and len(neb_images) > 0,
+                                  population_positions is not None and len(population_positions) > 0)
+
         # ---- 能量曲线子图 ----
         if energy_profile is not None:
             distances, energies = energy_profile
@@ -1443,6 +1471,110 @@ class PESCanvas(QWidget):
             self._clear_energy_plot(self._energy_contour_widget)
 
         self._current_layout = new_layout
+
+    def _add_contour_legend(self, has_traj, has_neb, has_population):
+        """在等高线图右上角添加半透明图例框，标注各类点的类型"""
+        # 清除旧图例（使用更彻底的方式删除）
+        if hasattr(self, '_legend_item') and self._legend_item is not None:
+            try:
+                # 先关闭再移除，避免残留
+                self._legend_item.setVisible(False)
+                # 移除所有子项
+                for item in list(self._legend_item.items):
+                    try:
+                        self._legend_item.removeItem(item[0])
+                    except Exception:
+                        pass
+                self._legend_item.setParentItem(None)
+                if self._legend_item.scene() is not None:
+                    self._legend_item.scene().removeItem(self._legend_item)
+            except Exception:
+                pass
+            self._legend_item = None
+
+        from pyqtgraph.graphicsItems.LegendItem import LegendItem
+        legend = LegendItem(offset=(0, 0))
+        legend.setParentItem(self._contour_widget.plotItem)
+        # 设置半透明背景
+        legend.setBrush(pg.mkBrush(255, 255, 255, 180))
+        legend.setPen(pg.mkPen(100, 100, 100, 200, width=1))
+
+        # 极小值（绿色圆点）
+        if self.pes is not None and any(cp['type'] == 'minimum' for cp in self.pes.critical_points()):
+            min_item = ScatterPlotItem(pen=pg.mkPen('g', width=1.5), brush=pg.mkBrush('g'),
+                                        size=8, symbol='o')
+            legend.addItem(min_item, '极小值')
+        # 鞍点（红色三角）
+        if self.pes is not None and any(cp['type'] == 'saddle' for cp in self.pes.critical_points()):
+            sad_item = ScatterPlotItem(pen=pg.mkPen('r', width=1.5), brush=pg.mkBrush('r'),
+                                        size=10, symbol='t')
+            legend.addItem(sad_item, '鞍点')
+        # 起点（蓝色方块）
+        if has_traj:
+            start_item = ScatterPlotItem(pen=pg.mkPen('w', width=1), brush=pg.mkBrush('#2196F3'),
+                                          size=10, symbol='s')
+            legend.addItem(start_item, '起点')
+            # 中间点（橙色小点）
+            mid_item = ScatterPlotItem(pen=pg.mkPen('w', width=0.5), brush=pg.mkBrush('#FF9800'),
+                                        size=5, symbol='o')
+            legend.addItem(mid_item, '轨迹点')
+            # 终点（红色圆）
+            end_item = ScatterPlotItem(pen=pg.mkPen('w', width=1), brush=pg.mkBrush('#F44336'),
+                                        size=10, symbol='o')
+            legend.addItem(end_item, '终点')
+        # NEB弹性带（青色）
+        if has_neb:
+            neb_item = ScatterPlotItem(pen=pg.mkPen('c', width=1), brush=pg.mkBrush('c'),
+                                        size=7, symbol='o')
+            legend.addItem(neb_item, '弹性带')
+        # 种群（紫色）
+        if has_population:
+            pop_item = ScatterPlotItem(pen=pg.mkPen('w', width=0.5), brush=pg.mkBrush('#9C27B0'),
+                                        size=6, symbol='o')
+            legend.addItem(pop_item, '种群')
+
+        # 定位到右上角
+        legend.anchor(itemPos=(1, 0), parentPos=(1, 0))
+        # 禁用拖拽，固定在右上角
+        legend.setFlag(legend.ItemIsMovable, False)
+        self._legend_item = legend
+
+    def _update_3d_legend(self, has_traj, has_neb, has_population):
+        """在3D视图右上角更新半透明图例标签"""
+        if not hasattr(self, '_3d_legend_label') or self._3d_legend_label is None:
+            return
+        lines = []
+        # 极小值（绿色圆点）
+        if self.pes is not None and any(cp['type'] == 'minimum' for cp in self.pes.critical_points()):
+            lines.append('<span style="color:#2e7d32;">●</span> 极小值')
+        # 鞍点（红色三角）
+        if self.pes is not None and any(cp['type'] == 'saddle' for cp in self.pes.critical_points()):
+            lines.append('<span style="color:#c62828;">▲</span> 鞍点')
+        # 起点（蓝色方块）
+        if has_traj:
+            lines.append('<span style="color:#2196F3;">■</span> 起点')
+            # 中间点（橙色小点）
+            lines.append('<span style="color:#FF9800;">●</span> 轨迹点')
+            # 终点（红色圆）
+            lines.append('<span style="color:#F44336;">●</span> 终点')
+        # NEB弹性带（青色）
+        if has_neb:
+            lines.append('<span style="color:#00BCD4;">●</span> 弹性带')
+        # 种群（紫色）
+        if has_population:
+            lines.append('<span style="color:#9C27B0;">●</span> 种群')
+
+        if lines:
+            self._3d_legend_label.setText("<br>".join(lines))
+            self._3d_legend_label.adjustSize()
+            self._3d_legend_label.setVisible(True)
+            # 定位到右上角
+            gw = self._gl_widget.width()
+            lw = self._3d_legend_label.width()
+            self._3d_legend_label.move(gw - lw - 8, 8)
+            self._3d_legend_label.raise_()
+        else:
+            self._3d_legend_label.setVisible(False)
 
     def draw_3d(self, trajectory=None, start_pos=None, end_pos=None,
                 neb_images=None, energy_profile=None, population_positions=None):
@@ -1587,6 +1719,16 @@ class PESCanvas(QWidget):
                 self._gl_widget.addItem(start_s)
                 self._3d_items.append(start_s)
 
+                # 中间点：橙色小点
+                if len(path) > 2:
+                    mid_pts = np.column_stack([path[1:-1], energies_scaled[1:-1]])
+                    mid_s = GLScatterPlotItem(
+                        pos=mid_pts,
+                        color=np.array([(1.0, 0.6, 0.0, 1)] * len(mid_pts)),
+                        size=6)
+                    self._gl_widget.addItem(mid_s)
+                    self._3d_items.append(mid_s)
+
                 end_s = GLScatterPlotItem(
                     pos=np.array([[path[-1, 0], path[-1, 1], energies_scaled[-1]]]),
                     color=np.array([(0.96, 0.26, 0.21, 1)]),
@@ -1643,6 +1785,12 @@ class PESCanvas(QWidget):
 
         # ---- 恢复相机状态 ----
         self._restore_camera_state(cam_state)
+
+        # ---- 更新3D图例 ----
+        has_traj = trajectory is not None and len(trajectory) > 0
+        has_neb = neb_images is not None and len(neb_images) > 0
+        has_pop = population_positions is not None and len(population_positions) > 0
+        self._update_3d_legend(has_traj, has_neb, has_pop)
 
         # ---- 能量曲线子图 ----
         if energy_profile is not None:
@@ -2785,6 +2933,10 @@ class ControlPanel(QWidget):
         ])
         cmp_algo_layout.addWidget(self.compare_algo_label)
         cmp_algo_layout.addWidget(self.compare_algo_combo)
+        self.compare_edit_params_btn = QPushButton("编辑参数")
+        self.compare_edit_params_btn.setToolTip("切换参数面板到对比方法，设置参数后再点此按钮返回")
+        self.compare_edit_params_btn.setVisible(False)
+        cmp_algo_layout.addWidget(self.compare_edit_params_btn)
         self.compare_algo_label.setVisible(False)
         self.compare_algo_combo.setVisible(False)
         compare_layout.addLayout(cmp_algo_layout)
@@ -2806,6 +2958,11 @@ class ControlPanel(QWidget):
         export_layout.addWidget(self.export_gif_btn)
         export_group.setLayout(export_layout)
         layout.addWidget(export_group)
+
+        # ---- 说明按钮（单独放置） ----
+        self.help_btn = QPushButton("使用说明")
+        self.help_btn.setObjectName("helpBtn")
+        layout.addWidget(self.help_btn)
 
         layout.addStretch()
 
@@ -2880,6 +3037,7 @@ class ControlPanel(QWidget):
         enabled = self.compare_check.isChecked()
         self.compare_algo_label.setVisible(enabled)
         self.compare_algo_combo.setVisible(enabled)
+        self.compare_edit_params_btn.setVisible(enabled)
 
     def get_speed_ms(self):
         """获取当前播放速度（毫秒）"""
@@ -3031,12 +3189,6 @@ class InfoPanel(QWidget):
         result_layout.addWidget(self.result_converge_label)
         result_layout.addWidget(self.result_energy_label)
         result_layout.addWidget(self.result_type_label)
-
-        # 对比表格
-        self.compare_table = QTableWidget()
-        self.compare_table.setMaximumHeight(80)
-        self.compare_table.setVisible(False)
-        result_layout.addWidget(self.compare_table)
 
         result_layout.addStretch()
         result_group.setLayout(result_layout)
@@ -3479,19 +3631,8 @@ class InfoPanel(QWidget):
         self.result_type_label.setText(f"收敛类型: {conv_type}")
 
     def show_compare_table(self, results):
-        """显示方法对比表格"""
-        self.compare_table.setVisible(True)
-        self.compare_table.setRowCount(len(results))
-        self.compare_table.setColumnCount(4)
-        self.compare_table.setHorizontalHeaderLabels(
-            ["方法", "收敛步数", "最终能量", "收敛类型"]
-        )
-        for i, r in enumerate(results):
-            self.compare_table.setItem(i, 0, QTableWidgetItem(r.get('method', '')))
-            self.compare_table.setItem(i, 1, QTableWidgetItem(str(r.get('steps', ''))))
-            self.compare_table.setItem(i, 2, QTableWidgetItem(f"{r.get('energy', 0):.6f}"))
-            self.compare_table.setItem(i, 3, QTableWidgetItem(r.get('type', '')))
-        self.compare_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        """显示方法对比表格（已移至主对比面板，此方法保留为空以兼容）"""
+        pass
 
     def reset(self):
         """重置信息面板"""
@@ -3505,7 +3646,6 @@ class InfoPanel(QWidget):
         self.result_converge_label.setText("收敛步数: -")
         self.result_energy_label.setText("最终能量: -")
         self.result_type_label.setText("收敛类型: -")
-        self.compare_table.setVisible(False)
 
 
 # ======================== 主窗口 ========================
@@ -3536,6 +3676,8 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self._timer_step)
         self.trajectory = []
         self.compare_trajectory = []
+        self._cmp_converge_notified = False  # 对比算法收敛提示标志，避免重复弹框
+        self._main_converge_notified = False  # 主算法收敛提示标志（对比模式下）
 
         self._init_ui()
         self._connect_signals()
@@ -3565,8 +3707,19 @@ class MainWindow(QMainWindow):
         self.canvas = PESCanvas()
         self.canvas.setFocusPolicy(Qt.StrongFocus)  # 允许接收键盘事件
         self.canvas._redraw_callback = self._update_view  # 网格扩展时重绘
-        # 注意：不再创建NavigationToolbar，pyqtgraph自带缩放/平移
-        viz_layout.addWidget(self.canvas)
+        # 第二个画布（用于方法对比）
+        self.canvas2 = PESCanvas()
+        self.canvas2.setFocusPolicy(Qt.StrongFocus)
+        self.canvas2._redraw_callback = self._update_view
+        self.canvas2.setVisible(False)  # 默认隐藏
+
+        # 水平布局放置两个画布
+        canvas_h_layout = QHBoxLayout()
+        canvas_h_layout.setContentsMargins(0, 0, 0, 0)
+        canvas_h_layout.setSpacing(2)
+        canvas_h_layout.addWidget(self.canvas, 1)  # stretch=1 确保等大
+        canvas_h_layout.addWidget(self.canvas2, 1)  # stretch=1 确保等大
+        viz_layout.addLayout(canvas_h_layout)
         upper_splitter.addWidget(viz_widget)
 
         # 设置分割比例 - 允许拖动调整
@@ -3578,13 +3731,31 @@ class MainWindow(QMainWindow):
         # 下方信息面板
         self.info_panel = InfoPanel()
 
-        # 垂直分割：上方 | 下方 - 允许拖动调整
+        # 方法对比面板（位于画布和信息面板之间）
+        self.compare_panel = QWidget()
+        self.compare_panel.setVisible(False)
+        self.compare_panel.setMinimumHeight(140)  # 确保内容可见
+        compare_panel_layout = QVBoxLayout(self.compare_panel)
+        compare_panel_layout.setContentsMargins(4, 2, 4, 2)
+        compare_panel_layout.setSpacing(2)
+        compare_title = QLabel("方法对比结果")
+        compare_title.setStyleSheet("font-weight: bold; color: #00d4ff;")
+        compare_panel_layout.addWidget(compare_title)
+        # 复用InfoPanel的compare_table样式，但这里独立创建
+        self.compare_table_main = QTableWidget()
+        self.compare_table_main.setMinimumHeight(100)
+        self.compare_table_main.setVisible(False)
+        compare_panel_layout.addWidget(self.compare_table_main)
+
+        # 垂直分割：上方 | 对比面板 | 下方 - 允许拖动调整
         main_splitter = QSplitter(Qt.Vertical)
         main_splitter.addWidget(upper_splitter)
+        main_splitter.addWidget(self.compare_panel)
         main_splitter.addWidget(self.info_panel)
-        main_splitter.setSizes([700, 200])
+        main_splitter.setSizes([500, 160, 200])
         main_splitter.setStretchFactor(0, 1)  # 上方自动拉伸
-        main_splitter.setStretchFactor(1, 0)  # 下方不自动拉伸
+        main_splitter.setStretchFactor(1, 0)  # 对比面板不自动拉伸
+        main_splitter.setStretchFactor(2, 0)  # 下方不自动拉伸
         main_splitter.setChildrenCollapsible(False)  # 不允许完全折叠
 
         outer_layout.addWidget(main_splitter)
@@ -3658,14 +3829,19 @@ class MainWindow(QMainWindow):
         cp.step_btn.clicked.connect(self._single_step)
         cp.reset_btn.clicked.connect(self._reset)
         cp.back_btn.clicked.connect(self._back_step)
+        cp.help_btn.clicked.connect(self._show_help)
+        cp.compare_check.stateChanged.connect(self._on_compare_mode_changed)
+        cp.compare_edit_params_btn.clicked.connect(self._toggle_compare_params_edit)
+        cp.compare_algo_combo.currentTextChanged.connect(self._on_compare_algo_changed)
 
         # 导出
         cp.export_csv_btn.clicked.connect(self._export_csv)
         cp.export_png_btn.clicked.connect(self._export_png)
         cp.export_gif_btn.clicked.connect(self._export_gif)
 
-        # 鼠标点击
+        # 鼠标点击（主画布和对比画布共用同一回调）
         self.canvas.set_click_callback(self._on_canvas_click)
+        self.canvas2.set_click_callback(self._on_canvas_click)
 
     def _load_pes(self):
         """加载势能面"""
@@ -3702,7 +3878,19 @@ class MainWindow(QMainWindow):
         self.canvas._user_xlim = None
         self.canvas._user_ylim = None
         self.canvas._cbar_ax = None  # 重建布局后colorbar axes也需要重置
+        self.canvas._reset_camera_center = True  # 切换PES后重置3D相机中心到新PES中心
         self.canvas._pan_offset[:] = 0  # 重置3D平移偏移
+        # 同步重置canvas2（对比画布）
+        self.canvas2._custom_bounds = None
+        self.canvas2._current_layout = None
+        self.canvas2._user_dist = None
+        self.canvas2._user_xlim = None
+        self.canvas2._user_ylim = None
+        self.canvas2._cbar_ax = None
+        self.canvas2._reset_camera_center = True
+        self.canvas2._pan_offset[:] = 0
+        self.canvas2.X = None  # 强制重新计算网格
+        self.canvas2.Z = None
         self._reset_state()
         self._render_pes()
 
@@ -3731,6 +3919,24 @@ class MainWindow(QMainWindow):
             float(test_val)
             self.pes = CustomPES(expression=expr)
             self.canvas._custom_bounds = None
+            self.canvas._current_layout = None  # 强制重建布局
+            self.canvas._user_dist = None
+            self.canvas._user_xlim = None
+            self.canvas._user_ylim = None
+            self.canvas._cbar_ax = None
+            self.canvas._reset_camera_center = True  # 切换PES后重置3D相机中心
+            self.canvas._pan_offset[:] = 0  # 重置3D平移偏移
+            # 同步重置canvas2（对比画布）
+            self.canvas2._custom_bounds = None
+            self.canvas2._current_layout = None
+            self.canvas2._user_dist = None
+            self.canvas2._user_xlim = None
+            self.canvas2._user_ylim = None
+            self.canvas2._cbar_ax = None
+            self.canvas2._reset_camera_center = True
+            self.canvas2._pan_offset[:] = 0
+            self.canvas2.X = None
+            self.canvas2.Z = None
             self._update_range_spins()
             self._reset_state()
             self._render_pes()
@@ -3791,8 +3997,20 @@ class MainWindow(QMainWindow):
         self.canvas._cbar_ax = None  # 重建布局后colorbar axes也需要重置
         self.canvas._reset_camera_center = True  # 范围变化后重置3D相机中心
         self.canvas._pan_offset[:] = 0  # 重置平移偏移
+        # 同步第二个画布的范围设置
+        if hasattr(self, 'canvas2'):
+            self.canvas2._custom_bounds = (xmin, xmax, ymin, ymax)
+            self.canvas2._user_dist = None
+            self.canvas2._user_xlim = None
+            self.canvas2._user_ylim = None
+            self.canvas2._current_layout = None
+            self.canvas2._cbar_ax = None
+            self.canvas2._reset_camera_center = True
+            self.canvas2._pan_offset[:] = 0
         # 不调用_reset_state()，保留当前轨迹和算法状态
         self.canvas.compute_grid(self.pes)
+        if hasattr(self, 'canvas2'):
+            self.canvas2.compute_grid(self.pes)
         self._update_view()
 
     def _render_pes(self):
@@ -3800,6 +4018,9 @@ class MainWindow(QMainWindow):
         if self.pes is None:
             return
         self.canvas.compute_grid(self.pes)
+        # 同步第二个画布的网格（用于方法对比）
+        if hasattr(self, 'canvas2'):
+            self.canvas2.compute_grid(self.pes)
         self.info_panel.update_pes_formula(self.pes)
         self._update_view()
 
@@ -3866,6 +4087,77 @@ class MainWindow(QMainWindow):
                 neb_images=neb_images,
                 energy_profile=energy_profile,
                 population_positions=population_positions,
+            )
+
+        # 方法对比模式：在第二个画布绘制对比算法的轨迹
+        if self.control_panel.compare_check.isChecked():
+            self._update_compare_view()
+
+    def _update_compare_view(self):
+        """更新方法对比的第二个画布视图"""
+        if self.pes is None or not self.control_panel.compare_check.isChecked():
+            return
+        # 确保canvas2已计算网格
+        if self.canvas2.Z is None:
+            self.canvas2.compute_grid(self.pes)
+
+        # 准备对比轨迹数据
+        cmp_trajectory = self.compare_trajectory if self.compare_trajectory else None
+        start_pos = self.start_pos
+        end_pos = self.end_pos if self._needs_two_endpoints() else None
+
+        # Dimer/CBD信息（对比算法）
+        cmp_dimer_info = None
+        cmp_algo_type = self.control_panel.compare_algo_combo.currentText()
+        if cmp_algo_type in ("Dimer方法", "CBD方法") and self.compare_algorithm is not None and self.compare_trajectory:
+            last = self.compare_trajectory[-1]
+            delta_r = self.control_panel.dimer_delta_r.value() if cmp_algo_type == "Dimer方法" else self.control_panel.cbd_delta_r.value()
+            cmp_dimer_info = {
+                'center': last.get('center', self.start_pos),
+                'direction': last.get('direction', np.array([1, 0])),
+                'delta_r': delta_r,
+            }
+
+        # NEB镜像点（对比算法）
+        cmp_neb_images = None
+        cmp_energy_profile = None
+        if cmp_algo_type in ("NEB方法", "CI-NEB方法") and self.compare_algorithm is not None:
+            cmp_neb_images = [img.tolist() for img in self.compare_algorithm.images]
+            if self.compare_trajectory:
+                last = self.compare_trajectory[-1]
+                if 'images' in last:
+                    cmp_neb_images = [img.tolist() for img in last['images']]
+                if 'path_energy_profile' in last:
+                    distances, _ = self.compare_algorithm.get_energy_profile()
+                    cmp_energy_profile = (distances, last['path_energy_profile'])
+
+        # 群体算法种群位置（对比算法）
+        cmp_population = None
+        if self.compare_trajectory:
+            last = self.compare_trajectory[-1]
+            if 'population_positions' in last:
+                cmp_population = last['population_positions']
+            elif 'particle_positions' in last:
+                cmp_population = last['particle_positions']
+
+        if self.control_panel.is_3d_mode():
+            self.canvas2.draw_3d(
+                trajectory=cmp_trajectory,
+                start_pos=start_pos,
+                end_pos=end_pos,
+                neb_images=cmp_neb_images,
+                energy_profile=cmp_energy_profile,
+                population_positions=cmp_population,
+            )
+        else:
+            self.canvas2.draw_contour(
+                trajectory=cmp_trajectory,
+                start_pos=start_pos,
+                end_pos=end_pos,
+                dimer_info=cmp_dimer_info,
+                neb_images=cmp_neb_images,
+                energy_profile=cmp_energy_profile,
+                population_positions=cmp_population,
             )
 
     def _on_algo_changed(self):
@@ -4202,8 +4494,18 @@ class MainWindow(QMainWindow):
                 # 对比算法
                 if self.control_panel.compare_check.isChecked():
                     compare_type = self.control_panel.compare_algo_combo.currentText()
+                    # 如果有保存的对比参数，临时恢复后创建算法
+                    saved_params = None
+                    if hasattr(self, '_compare_params') and self._compare_params:
+                        saved_params = self._capture_algo_params()
+                        self._restore_algo_params(self._compare_params)
                     self.compare_algorithm = self._create_algorithm(compare_type)
+                    # 恢复主算法的参数
+                    if saved_params is not None:
+                        self._restore_algo_params(saved_params)
                     self.compare_trajectory = []
+                    self._cmp_converge_notified = False  # 重置收敛提示标志
+                    self._main_converge_notified = False
 
             if self.algorithm.is_converged:
                 QMessageBox.information(self, "提示", "算法已收敛，请重置后再开始")
@@ -4218,7 +4520,13 @@ class MainWindow(QMainWindow):
 
     def _timer_step(self):
         """定时器回调：执行一步"""
-        if self.algorithm is None or self.algorithm.is_converged:
+        # 主算法和对比算法都收敛时才停止
+        main_converged = self.algorithm is None or self.algorithm.is_converged
+        cmp_converged = True
+        if self.control_panel.compare_check.isChecked() and self.compare_algorithm is not None:
+            cmp_converged = self.compare_algorithm.is_converged
+
+        if main_converged and cmp_converged:
             self.timer.stop()
             self.is_running = False
             self.control_panel.play_btn.setText("开始")
@@ -4233,15 +4541,70 @@ class MainWindow(QMainWindow):
                 # 对比结果
                 if self.control_panel.compare_check.isChecked() and self.compare_trajectory:
                     self._update_compare_results()
+            # 对比模式下：若尚未提示过收敛，补充提示（避免定时器先停止导致_do_step未弹框）
+            if self.control_panel.compare_check.isChecked() and self.compare_algorithm is not None:
+                cmp_algo_type = self.control_panel.compare_algo_combo.currentText()
+                cmp_iter = getattr(self.compare_algorithm, '_iter_count', len(self.compare_trajectory))
+                main_algo_type = self.control_panel.get_algo_type()
+                main_iter = len(self.trajectory)
+                msg_parts = []
+                if self.algorithm is not None and self.algorithm.is_converged and not getattr(self, '_main_converge_notified', False):
+                    msg_parts.append(f"主算法({main_algo_type})在 {main_iter} 步后收敛！")
+                    self._main_converge_notified = True
+                if self.compare_algorithm.is_converged and not getattr(self, '_cmp_converge_notified', False):
+                    msg_parts.append(f"对比算法({cmp_algo_type})在 {cmp_iter} 步后收敛！")
+                    self._cmp_converge_notified = True
+                if msg_parts:
+                    QMessageBox.information(self, "对比结束", "\n".join(msg_parts))
             return
 
-        # 检查是否超过最大迭代次数
-        if self._check_max_iter_reached():
+        # 检查主算法是否超过最大迭代次数
+        main_max_reached = False
+        if not main_converged and self._check_max_iter_reached():
+            main_max_reached = True
+        # 检查对比算法是否超过最大迭代次数
+        cmp_max_reached = False
+        if (self.control_panel.compare_check.isChecked() 
+                and self.compare_algorithm is not None 
+                and not cmp_converged):
+            cmp_max_iter = getattr(self.compare_algorithm, 'max_iter', None)
+            if cmp_max_iter is not None:
+                cmp_iter = getattr(self.compare_algorithm, '_iter_count', len(self.compare_trajectory))
+                if cmp_iter >= cmp_max_iter:
+                    cmp_max_reached = True
+
+        # 两个算法都达到上限或收敛时停止
+        if (main_converged or main_max_reached) and (cmp_converged or cmp_max_reached):
             self.timer.stop()
             self.is_running = False
             self.control_panel.play_btn.setText("开始")
             self.control_panel.play_btn.setObjectName("playBtn")
             self.control_panel.play_btn.setStyle(self.control_panel.play_btn.style())
+            if self.control_panel.compare_check.isChecked() and self.compare_trajectory:
+                self._update_compare_results()
+            # 对比模式下：结束时弹框提示（无论收敛与否）
+            if self.control_panel.compare_check.isChecked() and self.compare_algorithm is not None:
+                cmp_algo_type = self.control_panel.compare_algo_combo.currentText()
+                cmp_iter = getattr(self.compare_algorithm, '_iter_count', len(self.compare_trajectory))
+                main_algo_type = self.control_panel.get_algo_type()
+                main_iter = len(self.trajectory)
+                msg_parts = []
+                # 主算法状态
+                if self.algorithm is not None and not getattr(self, '_main_converge_notified', False):
+                    if self.algorithm.is_converged:
+                        msg_parts.append(f"主算法({main_algo_type})在 {main_iter} 步后收敛！")
+                    else:
+                        msg_parts.append(f"主算法({main_algo_type})达到最大迭代次数 {main_iter}，未收敛！")
+                    self._main_converge_notified = True
+                # 对比算法状态
+                if not getattr(self, '_cmp_converge_notified', False):
+                    if self.compare_algorithm.is_converged:
+                        msg_parts.append(f"对比算法({cmp_algo_type})在 {cmp_iter} 步后收敛！")
+                    else:
+                        msg_parts.append(f"对比算法({cmp_algo_type})达到最大迭代次数 {cmp_iter}，未收敛！")
+                    self._cmp_converge_notified = True
+                if msg_parts:
+                    QMessageBox.information(self, "对比结束", "\n".join(msg_parts))
             return
 
         self._do_step()
@@ -4256,13 +4619,33 @@ class MainWindow(QMainWindow):
                 else:
                     QMessageBox.warning(self, "提示", "请先设置初始点")
                 return
+            # 对比算法
+            if self.control_panel.compare_check.isChecked():
+                compare_type = self.control_panel.compare_algo_combo.currentText()
+                saved_params = None
+                if hasattr(self, '_compare_params') and self._compare_params:
+                    saved_params = self._capture_algo_params()
+                    self._restore_algo_params(self._compare_params)
+                self.compare_algorithm = self._create_algorithm(compare_type)
+                if saved_params is not None:
+                    self._restore_algo_params(saved_params)
+                self.compare_trajectory = []
+                self._cmp_converge_notified = False  # 重置收敛提示标志
+                self._main_converge_notified = False
 
-        if self.algorithm.is_converged:
+        # 对比模式下：主算法和对比算法都收敛才提示
+        main_converged = self.algorithm.is_converged
+        cmp_converged = True
+        if self.control_panel.compare_check.isChecked() and self.compare_algorithm is not None:
+            cmp_converged = self.compare_algorithm.is_converged
+        if main_converged and cmp_converged:
             QMessageBox.information(self, "提示", "算法已收敛")
             return
 
-        if self._check_max_iter_reached():
-            return
+        # 检查主算法最大迭代次数（对比模式下不阻止，仅主算法达到上限时）
+        if not main_converged and self._check_max_iter_reached():
+            if cmp_converged:
+                return
 
         self._do_step()
 
@@ -4287,19 +4670,22 @@ class MainWindow(QMainWindow):
 
     def _do_step(self):
         """执行一步算法并更新显示"""
-        try:
-            state = self.algorithm.step()
-            self.trajectory.append(state)
-        except Exception as e:
-            self.timer.stop()
-            self.is_running = False
-            self.control_panel.play_btn.setText("开始")
-            self.control_panel.play_btn.setObjectName("playBtn")
-            self.control_panel.play_btn.setStyle(self.control_panel.play_btn.style())
-            QMessageBox.warning(self, "计算错误", f"算法执行出错: {e}")
-            return
+        state = None
+        # 主算法步进（若未收敛）
+        if self.algorithm is not None and not self.algorithm.is_converged:
+            try:
+                state = self.algorithm.step()
+                self.trajectory.append(state)
+            except Exception as e:
+                self.timer.stop()
+                self.is_running = False
+                self.control_panel.play_btn.setText("开始")
+                self.control_panel.play_btn.setObjectName("playBtn")
+                self.control_panel.play_btn.setStyle(self.control_panel.play_btn.style())
+                QMessageBox.warning(self, "计算错误", f"算法执行出错: {e}")
+                return
 
-        # 对比算法步进
+        # 对比算法步进（若未收敛）
         if self.control_panel.compare_check.isChecked() and self.compare_algorithm is not None:
             if not self.compare_algorithm.is_converged:
                 try:
@@ -4309,39 +4695,91 @@ class MainWindow(QMainWindow):
                     pass
 
         # 更新偏置势可视化（SSW/MetaDynamics等算法会修改势能面）
-        bias_func = getattr(self.algorithm, 'get_bias_function', lambda: None)()
-        self.canvas.set_bias_function(bias_func)
+        if self.algorithm is not None:
+            bias_func = getattr(self.algorithm, 'get_bias_function', lambda: None)()
+            self.canvas.set_bias_function(bias_func)
 
-        # 更新信息面板
+        # 更新信息面板（使用最新的主算法状态）
         algo_type = self.control_panel.get_algo_type()
-        self.info_panel.update_physics(state, algo_type)
+        is_compare_mode = self.control_panel.compare_check.isChecked()
+        if state is not None:
+            self.info_panel.update_physics(state, algo_type)
+        elif self.trajectory:
+            self.info_panel.update_physics(self.trajectory[-1], algo_type)
 
         # 更新可视化
         self._update_view()
 
-        # 检查收敛
-        if self.algorithm.is_converged:
-            self.timer.stop()
-            self.is_running = False
-            self.control_panel.play_btn.setText("开始")
-            self.control_panel.play_btn.setObjectName("playBtn")
-            self.control_panel.play_btn.setStyle(self.control_panel.play_btn.style())
-            # 收敛后清除偏置势，恢复原始势能面
+        # 检查收敛：主算法和对比算法分别独立提示
+        main_just_converged = self.algorithm is not None and self.algorithm.is_converged and state is not None
+        cmp_just_converged = False
+        cmp_converged = True
+        if is_compare_mode and self.compare_algorithm is not None:
+            cmp_converged = self.compare_algorithm.is_converged
+            # 对比算法刚收敛：本次步进前未收敛（标志位），步进后收敛
+            # 使用标志位避免收敛后每个定时器周期都重复弹框
+            if cmp_converged and not getattr(self, '_cmp_converge_notified', False):
+                cmp_just_converged = True
+                self._cmp_converge_notified = True
+
+        if main_just_converged:
+            # 主算法收敛，更新结果
             self.canvas.set_bias_function(None)
             self.info_panel.update_result(self.trajectory, algo_type, self.pes)
-            if self.control_panel.compare_check.isChecked() and self.compare_trajectory:
+            if is_compare_mode and self.compare_trajectory:
                 self._update_compare_results()
-            QMessageBox.information(self, "收敛", f"算法在 {state.get('iteration', 0)} 步后收敛！")
+            self._main_converge_notified = True  # 标记主算法已提示收敛
+            # 若对比算法也已收敛，停止定时器
+            if cmp_converged:
+                self.timer.stop()
+                self.is_running = False
+                self.control_panel.play_btn.setText("开始")
+                self.control_panel.play_btn.setObjectName("playBtn")
+                self.control_panel.play_btn.setStyle(self.control_panel.play_btn.style())
+            # 对比模式下：若对比算法同时收敛，合并提示
+            if is_compare_mode and cmp_converged and not getattr(self, '_cmp_converge_notified', False):
+                cmp_algo_type = self.control_panel.compare_algo_combo.currentText()
+                cmp_iter = getattr(self.compare_algorithm, '_iter_count', len(self.compare_trajectory))
+                self._cmp_converge_notified = True
+                QMessageBox.information(self, "对比完成",
+                    f"主算法({algo_type})在 {state.get('iteration', 0)} 步后收敛！\n"
+                    f"对比算法({cmp_algo_type})在 {cmp_iter} 步后收敛！")
+            else:
+                QMessageBox.information(self, "主算法收敛", f"主算法({algo_type})在 {state.get('iteration', 0)} 步后收敛！")
+        elif cmp_just_converged and is_compare_mode:
+            # 对比算法刚收敛（主算法未收敛），更新对比结果
+            cmp_algo_type = self.control_panel.compare_algo_combo.currentText()
+            cmp_iter = getattr(self.compare_algorithm, '_iter_count', len(self.compare_trajectory))
+            if self.compare_trajectory:
+                self._update_compare_results()
+            QMessageBox.information(self, "对比算法收敛", f"对比算法({cmp_algo_type})在 {cmp_iter} 步后收敛！")
 
     def _back_step(self):
         """回退一步"""
         if not self.trajectory:
             return
 
-        # 移除最后一步
+        # 移除最后一步（主算法）
         self.trajectory.pop()
 
-        # 恢复算法状态
+        # 对比算法也回退一步（保持同步）
+        if self.control_panel.compare_check.isChecked() and self.compare_trajectory:
+            self.compare_trajectory.pop()
+            # 重建对比算法并重放
+            if self.compare_algorithm is not None:
+                cmp_algo_type = self.control_panel.compare_algo_combo.currentText()
+                saved_params = None
+                if hasattr(self, '_compare_params') and self._compare_params:
+                    saved_params = self._capture_algo_params()
+                    self._restore_algo_params(self._compare_params)
+                self.compare_algorithm = self._create_algorithm(cmp_algo_type)
+                if saved_params is not None:
+                    self._restore_algo_params(saved_params)
+                if self.compare_algorithm is not None:
+                    for _ in range(len(self.compare_trajectory)):
+                        self.compare_algorithm.step()
+
+        # 恢复主算法状态
         if self.algorithm is not None:
             # 重建算法并重放到上一步
             algo_type = self.control_panel.get_algo_type()
@@ -4366,8 +4804,98 @@ class MainWindow(QMainWindow):
         self._reset_state()
         self._update_view()
         self.info_panel.reset()
+        # 清除对比结果表格
+        self.compare_table_main.setVisible(False)
+        self.compare_table_main.setRowCount(0)
         algo_type = self.control_panel.get_algo_type()
         self.info_panel.update_principle(algo_type)
+
+    def _show_help(self):
+        """显示使用说明对话框"""
+        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QTextBrowser, QPushButton, QHBoxLayout
+        dlg = QDialog(self)
+        dlg.setWindowTitle("使用说明")
+        dlg.resize(720, 600)
+        layout = QVBoxLayout(dlg)
+        browser = QTextBrowser()
+        browser.setOpenExternalLinks(True)
+        # 深色背景，白色字体
+        browser.setStyleSheet("QTextBrowser { background-color: #1a1b2e; color: #ffffff; }")
+        browser.setHtml(self._get_help_html())
+        layout.addWidget(browser)
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(dlg.accept)
+        btn_layout.addWidget(close_btn)
+        layout.addLayout(btn_layout)
+        dlg.exec_()
+
+    def _get_help_html(self):
+        """返回使用说明的HTML内容"""
+        return """
+        <html><body style='font-family: Microsoft YaHei; font-size: 13px; line-height: 1.6; color: #ffffff; background-color: #1a1b2e;'>
+        <h2 style='color: #00d4ff;'>势能面可视化工具 使用说明</h2>
+
+        <h3 style='color: #4fc3f7;'>一、基本操作</h3>
+        <ul>
+        <li><b>选择势能面：</b>左上角下拉框选择内置势能面（Müller-Brown、双阱、Rosenbrock等），或选择"自定义"输入表达式。</li>
+        <li><b>调整范围：</b>在"显示范围"区修改 x/y 的最小/最大值，点击"应用"按钮刷新。</li>
+        <li><b>切换视图：</b>顶部按钮切换"等高线图"和"3D曲面图"。</li>
+        <li><b>3D视图操作：</b>左键拖拽旋转，右键拖拽平移，滚轮缩放。</li>
+        </ul>
+
+        <h3 style='color: #4fc3f7;'>二、算法运行</h3>
+        <ul>
+        <li><b>选择算法：</b>左栏"算法选择"下拉框选择优化算法。</li>
+        <li><b>设置初始点：</b>点击"设置"按钮，然后在势能面图上点击选择初始点。部分算法（NEB、Dimer等）需要两个点。</li>
+        <li><b>调整参数：</b>在"算法参数"区调整步长、收敛阈值等参数。</li>
+        <li><b>开始/暂停：</b>点击"开始"按钮启动算法，运行中变为"暂停"。</li>
+        <li><b>单步执行：</b>点击"单步"按钮逐步执行算法。</li>
+        <li><b>回退：</b>点击"回退一步"撤销上一步。</li>
+        <li><b>重置：</b>点击"重置"清除轨迹重新开始。</li>
+        </ul>
+
+        <h3 style='color: #4fc3f7;'>三、点标注说明</h3>
+        <ul>
+        <li><span style='color:#66bb6a;'>●</span> <b>绿色圆点</b>：势能面的极小值点</li>
+        <li><span style='color:#ef5350;'>▲</span> <b>红色三角</b>：势能面的鞍点</li>
+        <li><span style='color:#2196F3;'>■</span> <b>蓝色方块</b>：算法起点</li>
+        <li><span style='color:#FF9800;'>●</span> <b>橙色小点</b>：算法轨迹中间点</li>
+        <li><span style='color:#F44336;'>●</span> <b>红色圆点</b>：算法终点（收敛点）</li>
+        <li><span style='color:#00BCD4;'>●</span> <b>青色点</b>：NEB弹性带图像</li>
+        <li><span style='color:#9C27B0;'>●</span> <b>紫色点</b>：群体算法种群粒子</li>
+        </ul>
+        <p>右上角半透明框显示当前图中的点类型图例（等高线图和3D图均有）。</p>
+
+        <h3 style='color: #4fc3f7;'>四、导出功能</h3>
+        <ul>
+        <li><b>导出CSV：</b>导出轨迹数据（坐标、能量、梯度等）。</li>
+        <li><b>导出PNG：</b>导出当前视图为图片。</li>
+        <li><b>导出GIF：</b>导出算法搜索过程的动画（等高线图+两个3D视角）。</li>
+        </ul>
+
+        <h3 style='color: #4fc3f7;'>五、方法对比</h3>
+        <ul>
+        <li>勾选"启用方法对比"，选择第二种算法。</li>
+        <li>点击"编辑参数"可设置第二种算法的参数，设置完成后点击"完成参数"返回。</li>
+        <li>启用后图形区分为左右两部分，分别显示两种算法的运行过程。</li>
+        <li>图形与下栏之间显示两种方法的对比结果（收敛步数、最终能量等）。</li>
+        <li>导出GIF时同时导出两种方法的动画。</li>
+        </ul>
+
+        <h3 style='color: #4fc3f7;'>六、下栏信息</h3>
+        <ul>
+        <li><b>实时物理量：</b>当前坐标、能量、梯度模长、Hessian本征值等。</li>
+        <li><b>结果统计：</b>收敛步数、最终能量、收敛类型。</li>
+        <li><b>势能面公式：</b>当前势能面的数学表达式。</li>
+        <li><b>算法原理：</b>当前算法的原理说明。</li>
+        </ul>
+
+        <hr>
+        <p style='color:#aaaaaa; font-size:11px;'>提示：字体大小会根据窗口大小自动调整。如遇显示问题，可尝试调整窗口大小。</p>
+        </body></html>
+        """
 
     def _reset_state(self):
         """重置内部状态"""
@@ -4380,6 +4908,8 @@ class MainWindow(QMainWindow):
         self.compare_algorithm = None
         self.trajectory = []
         self.compare_trajectory = []
+        self._cmp_converge_notified = False  # 重置收敛提示标志
+        self._main_converge_notified = False
         self.start_pos = None
         self.end_pos = None
         self.click_mode = 'start'
@@ -4420,7 +4950,153 @@ class MainWindow(QMainWindow):
                 'type': self._get_converge_type(last),
             })
 
+        # 同时更新InfoPanel的表格和主对比面板的表格
         self.info_panel.show_compare_table(results)
+        self._show_main_compare_table(results)
+
+    def _show_main_compare_table(self, results):
+        """在主对比面板显示对比结果表格"""
+        self.compare_table_main.setVisible(True)
+        # 先清空旧内容
+        self.compare_table_main.clearContents()
+        self.compare_table_main.setRowCount(len(results))
+        self.compare_table_main.setColumnCount(4)
+        self.compare_table_main.setHorizontalHeaderLabels(
+            ["方法", "收敛步数", "最终能量", "收敛类型"]
+        )
+        for i, r in enumerate(results):
+            self.compare_table_main.setItem(i, 0, QTableWidgetItem(r.get('method', '')))
+            self.compare_table_main.setItem(i, 1, QTableWidgetItem(str(r.get('steps', ''))))
+            self.compare_table_main.setItem(i, 2, QTableWidgetItem(f"{r.get('energy', 0):.6f}"))
+            self.compare_table_main.setItem(i, 3, QTableWidgetItem(r.get('type', '')))
+        self.compare_table_main.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        # 强制刷新
+        self.compare_table_main.update()
+
+    def _on_compare_algo_changed(self):
+        """对比算法类型切换时重置对比状态"""
+        # 仅在非编辑参数模式下处理（编辑模式下algo_combo会触发此信号）
+        if getattr(self, '_editing_compare_params', False):
+            return
+        # 重置对比算法状态
+        self.compare_algorithm = None
+        self.compare_trajectory = []
+        self._cmp_converge_notified = False  # 重置收敛提示标志
+        self._main_converge_notified = False
+        self.compare_table_main.setVisible(False)
+        self.compare_table_main.setRowCount(0)
+        # 更新视图
+        if self.pes is not None:
+            self._update_view()
+
+    def _on_compare_mode_changed(self):
+        """方法对比模式切换"""
+        enabled = self.control_panel.compare_check.isChecked()
+        self.canvas2.setVisible(enabled)
+        self.compare_panel.setVisible(enabled)
+        # 重置对比算法状态
+        if not enabled:
+            self.compare_algorithm = None
+            self.compare_trajectory = []
+            self.compare_table_main.setVisible(False)
+            # 如果正在编辑参数，恢复算法选择下拉框
+            cp = self.control_panel
+            if getattr(self, '_editing_compare_params', False):
+                self._editing_compare_params = False
+                if hasattr(self, '_saved_algo_index'):
+                    cp.algo_combo.blockSignals(True)
+                    cp.algo_combo.setCurrentIndex(self._saved_algo_index)
+                    cp._update_algo_params()
+                    cp.algo_combo.blockSignals(False)
+                cp.algo_combo.setEnabled(True)
+                cp.compare_algo_combo.setEnabled(True)
+                cp.play_btn.setEnabled(True)
+                cp.step_btn.setEnabled(True)
+                cp.compare_edit_params_btn.setText("编辑参数")
+                cp.compare_edit_params_btn.setStyleSheet("")
+        # 更新视图
+        if self.pes is not None:
+            self.canvas2.compute_grid(self.pes)
+            self._update_view()
+
+    def _toggle_compare_params_edit(self):
+        """切换参数面板编辑主算法或对比算法的参数"""
+        cp = self.control_panel
+        if cp.compare_edit_params_btn.text() == "编辑参数":
+            # 切换到对比算法的参数显示
+            self._editing_compare_params = True
+            self._saved_algo_index = cp.algo_combo.currentIndex()
+            cmp_type = cp.compare_algo_combo.currentText()
+            # 找到对比算法在algo_combo中的索引
+            idx = cp.algo_combo.findText(cmp_type)
+            if idx >= 0:
+                cp.algo_combo.blockSignals(True)
+                cp.algo_combo.setCurrentIndex(idx)
+                cp._update_algo_params()
+                cp.algo_combo.blockSignals(False)
+            # 禁用算法选择下拉框，避免用户手动切换产生不一致
+            cp.algo_combo.setEnabled(False)
+            cp.compare_algo_combo.setEnabled(False)
+            # 禁用播放控制按钮，避免在编辑参数时启动算法
+            cp.play_btn.setEnabled(False)
+            cp.step_btn.setEnabled(False)
+            cp.compare_edit_params_btn.setText("完成参数")
+            cp.compare_edit_params_btn.setStyleSheet("background-color: #FF9800; color: white;")
+        else:
+            # 保存对比算法的参数值
+            self._compare_params = self._capture_algo_params()
+            # 返回主算法的参数显示
+            self._editing_compare_params = False
+            cp.algo_combo.blockSignals(True)
+            cp.algo_combo.setCurrentIndex(self._saved_algo_index)
+            cp._update_algo_params()
+            cp.algo_combo.blockSignals(False)
+            # 恢复算法选择下拉框和播放控制按钮
+            cp.algo_combo.setEnabled(True)
+            cp.compare_algo_combo.setEnabled(True)
+            cp.play_btn.setEnabled(True)
+            cp.step_btn.setEnabled(True)
+            cp.compare_edit_params_btn.setText("编辑参数")
+            cp.compare_edit_params_btn.setStyleSheet("")
+
+    def _capture_algo_params(self):
+        """捕获当前所有算法参数spinbox的值，返回字典"""
+        cp = self.control_panel
+        params = {}
+        for name in ['newton_threshold', 'newton_max_iter',
+                     'dimer_delta_r', 'dimer_threshold', 'dimer_max_iter', 'dimer_trans_step',
+                     'neb_n_images', 'neb_spring_k', 'neb_threshold', 'neb_max_iter',
+                     'sd_step_size', 'sd_threshold', 'sd_max_iter',
+                     'bh_step_size', 'bh_temperature', 'bh_max_iter',
+                     'mc_step_size', 'mc_temperature', 'mc_max_iter',
+                     'sSW_step_size', 'sSW_gaussian_height', 'sSW_gaussian_width', 'sSW_temperature', 'sSW_max_iter',
+                     'meta_gaussian_height', 'meta_gaussian_width', 'meta_max_iter',
+                     'mh_kinetic', 'mh_max_iter',
+                     'ga_pop_size', 'ga_mutation_rate', 'ga_max_iter', 'ga_search_range',
+                     'pso_n_particles', 'pso_w', 'pso_c1', 'pso_c2', 'pso_max_iter',
+                     'abc_n_bees', 'abc_limit', 'abc_max_iter', 'abc_search_range',
+                     'us_n_windows', 'us_spring_k', 'us_mc_step_size', 'us_mc_temperature', 'us_steps_per_window', 'us_max_iter',
+                     'abf_n_bins', 'abf_mc_step_size', 'abf_mc_temperature', 'abf_max_iter',
+                     'cbd_delta_r', 'cbd_threshold', 'cbd_trans_step', 'cbd_max_iter',
+                     'desw_step_size', 'desw_gaussian_height', 'desw_gaussian_width', 'desw_temperature', 'desw_max_iter']:
+            spin = getattr(cp, name, None)
+            if spin is not None:
+                try:
+                    params[name] = spin.value()
+                except Exception:
+                    pass
+        return params
+
+    def _restore_algo_params(self, params):
+        """从字典恢复算法参数spinbox的值"""
+        cp = self.control_panel
+        for name, value in params.items():
+            spin = getattr(cp, name, None)
+            if spin is not None:
+                try:
+                    spin.setValue(value)
+                except Exception:
+                    pass
 
     def _get_converge_type(self, state):
         """获取收敛类型描述"""
@@ -4557,17 +5233,26 @@ class MainWindow(QMainWindow):
             # 强制重建布局
             self.canvas._current_layout = None
 
+            # 是否为方法对比模式
+            is_compare_mode = self.control_panel.compare_check.isChecked() and len(self.compare_trajectory) > 0
+            if is_compare_mode:
+                # 确保canvas2已计算网格
+                if self.canvas2.Z is None:
+                    self.canvas2.compute_grid(self.pes)
+                self.canvas2._current_layout = None
+
             # 3D视角参数
             cam_angles = [
                 {'elevation': 30, 'azimuth': 45},   # 默认斜视角
                 {'elevation': 60, 'azimuth': -30},   # 高角度俯视
             ]
 
-            def render_frame(partial_traj, start_pos, end_pos, dimer_info, neb_images, energy_profile, population_positions=None):
+            def render_frame(partial_traj, start_pos, end_pos, dimer_info, neb_images, energy_profile, population_positions=None,
+                             cmp_partial_traj=None, cmp_dimer_info=None, cmp_neb_images=None, cmp_energy_profile=None, cmp_pop_positions=None):
                 """渲染一帧的三视图并拼接"""
                 frame_images = []
 
-                # 视图1：等高线图
+                # 视图1：等高线图（主算法）
                 self.canvas._current_layout = None
                 self.canvas.draw_contour(
                     trajectory=partial_traj,
@@ -4584,7 +5269,25 @@ class MainWindow(QMainWindow):
                 frame_images.append(Image.open(buf).copy())
                 buf.close()
 
-                # 视图2和3：两个3D视角
+                # 视图1b：等高线图（对比算法，如果启用）
+                if is_compare_mode:
+                    self.canvas2._current_layout = None
+                    self.canvas2.draw_contour(
+                        trajectory=cmp_partial_traj,
+                        start_pos=start_pos,
+                        end_pos=end_pos,
+                        dimer_info=cmp_dimer_info,
+                        neb_images=cmp_neb_images,
+                        energy_profile=cmp_energy_profile,
+                        population_positions=cmp_pop_positions,
+                    )
+                    if gif_xlim is not None:
+                        self.canvas2.set_view_range(gif_xlim, gif_ylim)
+                    buf = self.canvas2.get_frame_image()
+                    frame_images.append(Image.open(buf).copy())
+                    buf.close()
+
+                # 视图2和3：两个3D视角（主算法）
                 for cam in cam_angles:
                     self.canvas._current_layout = None
                     self.canvas.draw_3d(
@@ -4605,6 +5308,28 @@ class MainWindow(QMainWindow):
                     buf = self.canvas.get_frame_image()
                     frame_images.append(Image.open(buf).copy())
                     buf.close()
+
+                # 视图2b和3b：两个3D视角（对比算法，如果启用）
+                if is_compare_mode:
+                    for cam in cam_angles:
+                        self.canvas2._current_layout = None
+                        self.canvas2.draw_3d(
+                            trajectory=cmp_partial_traj,
+                            start_pos=start_pos,
+                            end_pos=end_pos,
+                            neb_images=cmp_neb_images,
+                            energy_profile=cmp_energy_profile,
+                            population_positions=cmp_pop_positions,
+                        )
+                        try:
+                            self.canvas2._gl_widget.opts['elevation'] = cam['elevation']
+                            self.canvas2._gl_widget.opts['azimuth'] = cam['azimuth']
+                            self.canvas2._gl_widget.update()
+                        except Exception:
+                            pass
+                        buf = self.canvas2.get_frame_image()
+                        frame_images.append(Image.open(buf).copy())
+                        buf.close()
 
                 # 拼接三视图：水平排列
                 widths = [img.width for img in frame_images]
@@ -4630,14 +5355,25 @@ class MainWindow(QMainWindow):
             start_pos = self.start_pos
             end_pos = self.end_pos if self._needs_two_endpoints() else None
             algo_type = self.control_panel.get_algo_type()
+            cmp_algo_type = self.control_panel.compare_algo_combo.currentText() if is_compare_mode else None
 
             # 第一帧：只有初始点
-            combined = render_frame(None, start_pos, end_pos, None, None, None)
+            cmp_args = {}
+            if is_compare_mode:
+                cmp_args = dict(cmp_partial_traj=None, cmp_dimer_info=None, cmp_neb_images=None,
+                                cmp_energy_profile=None, cmp_pop_positions=None)
+            combined = render_frame(None, start_pos, end_pos, None, None, None, **cmp_args)
             images.append(combined)
 
             # 后续帧：逐步添加轨迹
-            for i in range(1, len(self.trajectory) + 1):
-                partial_traj = self.trajectory[:i]
+            # 确定最大帧数（主算法和对比算法中的较大值）
+            max_frames = len(self.trajectory)
+            if is_compare_mode:
+                max_frames = max(max_frames, len(self.compare_trajectory))
+
+            for i in range(1, max_frames + 1):
+                # 主算法轨迹（截断到可用长度）
+                partial_traj = self.trajectory[:i] if i <= len(self.trajectory) else self.trajectory
 
                 dimer_info = None
                 if algo_type == "Dimer方法" and partial_traj:
@@ -4677,9 +5413,43 @@ class MainWindow(QMainWindow):
                         bias_func = temp_algo.get_bias_function()
                         self.canvas.set_bias_function(bias_func)
 
+                # 准备对比算法数据
+                cmp_args = {}
+                if is_compare_mode:
+                    cmp_partial_traj = self.compare_trajectory[:i] if i <= len(self.compare_trajectory) else self.compare_trajectory
+                    cmp_dimer_info = None
+                    if cmp_algo_type == "Dimer方法" and cmp_partial_traj:
+                        last = cmp_partial_traj[-1]
+                        cmp_dimer_info = {
+                            'center': last.get('center', self.start_pos),
+                            'direction': last.get('direction', np.array([1, 0])),
+                            'delta_r': self.control_panel.dimer_delta_r.value(),
+                        }
+                    cmp_neb_images = None
+                    cmp_energy_profile = None
+                    if cmp_algo_type in ("NEB方法", "CI-NEB方法") and self.compare_algorithm is not None:
+                        if cmp_partial_traj:
+                            last = cmp_partial_traj[-1]
+                            if 'images' in last:
+                                cmp_neb_images = [img.tolist() for img in last['images']]
+                            if 'path_energy_profile' in last:
+                                distances, _ = self.compare_algorithm.get_energy_profile()
+                                cmp_energy_profile = (distances, last['path_energy_profile'])
+                    cmp_pop_positions = None
+                    if cmp_partial_traj:
+                        last = cmp_partial_traj[-1]
+                        if 'population_positions' in last:
+                            cmp_pop_positions = last['population_positions']
+                        elif 'particle_positions' in last:
+                            cmp_pop_positions = last['particle_positions']
+                    cmp_args = dict(
+                        cmp_partial_traj=cmp_partial_traj, cmp_dimer_info=cmp_dimer_info,
+                        cmp_neb_images=cmp_neb_images, cmp_energy_profile=cmp_energy_profile,
+                        cmp_pop_positions=cmp_pop_positions)
+
                 combined = render_frame(
                     partial_traj, start_pos, end_pos,
-                    dimer_info, neb_images, energy_profile, pop_positions)
+                    dimer_info, neb_images, energy_profile, pop_positions, **cmp_args)
                 images.append(combined)
 
             # 恢复布局状态
