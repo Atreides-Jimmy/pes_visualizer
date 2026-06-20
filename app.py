@@ -407,6 +407,8 @@ class PESCanvas(QWidget):
         self._Z_original = None  # 无偏置的原始Z数据
         self._reset_camera_center = False  # 是否重置3D相机中心到新PES中心
         self._legend_item = None  # 等高线图图例项（确保唯一）
+        self._method_label = None  # 等高线图方法名标签（对比模式）
+        self._method_name = None  # 当前方法名（用于显示）
 
         # 当前布局状态
         self._current_layout = None  # 'contour', 'contour+energy', '3d', '3d+energy'
@@ -534,6 +536,49 @@ class PESCanvas(QWidget):
     def set_click_callback(self, callback):
         """设置鼠标点击回调函数"""
         self._click_callback = callback
+
+    def set_method_name(self, name):
+        """设置当前方法名（用于对比模式标注）"""
+        self._method_name = name
+        # 立即更新标签显示
+        self._update_method_label()
+
+    def _ensure_method_label(self):
+        """确保方法名标签QLabel存在（覆盖在画布左上角，不可拖动）"""
+        if self._method_label is None:
+            self._method_label = QLabel(self)
+            self._method_label.setStyleSheet(
+                "background-color: rgba(255, 255, 255, 200);"
+                "color: #d32f2f;"
+                "border: 1px solid rgba(211, 47, 47, 180);"
+                "padding: 3px 8px;"
+                "font-size: 12px;"
+                "font-weight: bold;"
+            )
+            self._method_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+            self._method_label.setText("")
+            self._method_label.setVisible(False)
+            self._method_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        return self._method_label
+
+    def _update_method_label(self):
+        """更新方法名标签的文本和位置"""
+        label = self._ensure_method_label()
+        if self._method_name:
+            label.setText(self._method_name)
+            label.adjustSize()
+            label.setVisible(True)
+            # 定位到左上角
+            label.move(8, 8)
+            label.raise_()
+        else:
+            label.setVisible(False)
+
+    def _update_method_label_pos(self):
+        """更新方法名标签位置（兼容方法）"""
+        if self._method_label is not None and self._method_name:
+            self._method_label.move(8, 8)
+            self._method_label.raise_()
 
     def _make_3d_click_handler(self, original_handler):
         """创建3D视图的鼠标点击处理器
@@ -910,6 +955,11 @@ class PESCanvas(QWidget):
             except Exception:
                 pass
         self._3d_items = []
+        # 强制重绘以释放GL资源
+        try:
+            self._gl_widget.update()
+        except Exception:
+            pass
 
     def _save_camera_state(self):
         """保存当前3D相机状态"""
@@ -1470,6 +1520,9 @@ class PESCanvas(QWidget):
         else:
             self._clear_energy_plot(self._energy_contour_widget)
 
+        # ---- 方法名标签（左上角，对比模式标注）----
+        self._update_method_label()
+
         self._current_layout = new_layout
 
     def _add_contour_legend(self, has_traj, has_neb, has_population):
@@ -1660,6 +1713,8 @@ class PESCanvas(QWidget):
         )
         self._gl_widget.addItem(surface)
         self._3d_items.append(surface)
+        # 强制更新GL widget，确保曲面正确渲染
+        self._gl_widget.update()
 
         # ---- 添加三维坐标轴 ----
         self._add_3d_axes(Xs, Ys, Zs_scaled, z_min, z_max, z_scale)
@@ -1791,6 +1846,8 @@ class PESCanvas(QWidget):
         has_neb = neb_images is not None and len(neb_images) > 0
         has_pop = population_positions is not None and len(population_positions) > 0
         self._update_3d_legend(has_traj, has_neb, has_pop)
+        # 更新方法名标签（QLabel覆盖在画布上）
+        self._update_method_label()
 
         # ---- 能量曲线子图 ----
         if energy_profile is not None:
@@ -1831,10 +1888,52 @@ class PESCanvas(QWidget):
 
     def get_frame_image(self):
         """获取当前帧的图像数据（用于GIF导出）"""
-        pixmap = self.grab()
-        image = pixmap.toImage()
-        # QImage.save()不支持BytesIO，需要使用QBuffer
         from PyQt5.QtCore import QBuffer
+        from PyQt5.QtWidgets import QApplication
+        # 确保所有待绘制事件已处理
+        QApplication.processEvents()
+        # 3D模式：使用GLViewWidget的grabFramebuffer确保OpenGL内容正确捕获
+        if self.mode == '3d' and self._gl_widget is not None:
+            # 确保GL widget可见且已更新
+            self._gl_widget.show()
+            # 使用repaint强制同步重绘（比update更可靠）
+            try:
+                self._gl_widget.repaint()
+            except Exception:
+                self._gl_widget.update()
+            QApplication.processEvents()
+            # 强制OpenGL重绘
+            try:
+                self._gl_widget.updateGL()
+            except Exception:
+                pass
+            QApplication.processEvents()
+            # 再次repaint确保渲染完成
+            try:
+                self._gl_widget.repaint()
+            except Exception:
+                pass
+            QApplication.processEvents()
+            # 使用grabFramebuffer捕获OpenGL内容
+            try:
+                gl_image = self._gl_widget.grabFramebuffer()
+            except Exception:
+                gl_image = self.grab().toImage()
+            # 将QLabel覆盖层（方法名标签、3D图例）绘制到图像上
+            image = gl_image.copy()
+            painter = QPainter(image)
+            # 绘制方法名标签
+            if self._method_label is not None and self._method_label.isVisible():
+                self._method_label.render(painter, self._method_label.pos())
+            # 绘制3D图例标签
+            if hasattr(self, '_3d_legend_label') and self._3d_legend_label is not None and self._3d_legend_label.isVisible():
+                # 3D图例是GL widget的子控件，位置相对于GL widget
+                legend_pos = self._3d_legend_label.pos()
+                self._3d_legend_label.render(painter, legend_pos)
+            painter.end()
+        else:
+            pixmap = self.grab()
+            image = pixmap.toImage()
         buf = QBuffer()
         buf.open(QBuffer.ReadWrite)
         image.save(buf, 'PNG')
@@ -4069,6 +4168,12 @@ class MainWindow(QMainWindow):
             elif 'particle_positions' in last:
                 population_positions = last['particle_positions']
 
+        # 设置主画布方法名（对比模式下标注）
+        if self.control_panel.compare_check.isChecked():
+            self.canvas.set_method_name(self.control_panel.get_algo_type())
+        else:
+            self.canvas.set_method_name(None)
+
         if self.control_panel.is_3d_mode():
             self.canvas.draw_3d(
                 trajectory=trajectory,
@@ -4139,6 +4244,9 @@ class MainWindow(QMainWindow):
                 cmp_population = last['population_positions']
             elif 'particle_positions' in last:
                 cmp_population = last['particle_positions']
+
+        # 设置对比画布方法名
+        self.canvas2.set_method_name(cmp_algo_type)
 
         if self.control_panel.is_3d_mode():
             self.canvas2.draw_3d(
@@ -4645,12 +4753,14 @@ class MainWindow(QMainWindow):
         # 检查主算法最大迭代次数（对比模式下不阻止，仅主算法达到上限时）
         if not main_converged and self._check_max_iter_reached():
             if cmp_converged:
+                QMessageBox.information(self, "达到上限",
+                    f"主算法已达到最大迭代次数 {getattr(self.algorithm, 'max_iter', '?')}，未收敛")
                 return
 
         self._do_step()
 
     def _check_max_iter_reached(self):
-        """检查算法是否已达到最大迭代次数"""
+        """检查算法是否已达到最大迭代次数（不弹框，仅返回状态）"""
         if self.algorithm is None:
             return False
         max_iter = getattr(self.algorithm, 'max_iter', None)
@@ -4664,7 +4774,6 @@ class MainWindow(QMainWindow):
                 self.control_panel.get_algo_type(),
                 self.pes,
             )
-            QMessageBox.information(self, "达到上限", f"已达到最大迭代次数 {max_iter}，算法未收敛")
             return True
         return False
 
@@ -5196,6 +5305,15 @@ class MainWindow(QMainWindow):
         try:
             from PIL import Image
 
+            # 显示进度对话框（模态，避免用户操作干扰）
+            from PyQt5.QtWidgets import QProgressDialog
+            progress = QProgressDialog("正在导出GIF，请稍候...", "取消", 0, 100, self)
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.setWindowTitle("导出GIF")
+            progress.setValue(0)
+            QApplication.processEvents()
+
             # 保存当前布局状态
             old_mode = self.canvas.mode
             old_layout = self.canvas._current_layout
@@ -5203,6 +5321,8 @@ class MainWindow(QMainWindow):
             old_user_ylim = self.canvas._user_ylim
             old_user_dist = self.canvas._user_dist
             old_cam_state = self.canvas._save_camera_state()
+            old_main_method = self.canvas._method_name
+            old_cmp_method = self.canvas2._method_name if hasattr(self, 'canvas2') else None
 
             # 计算完整轨迹的范围
             all_points = []
@@ -5241,6 +5361,15 @@ class MainWindow(QMainWindow):
                     self.canvas2.compute_grid(self.pes)
                 self.canvas2._current_layout = None
 
+            # 设置方法名标注（对比模式下）
+            if is_compare_mode:
+                self.canvas.set_method_name(self.control_panel.get_algo_type())
+                self.canvas2.set_method_name(self.control_panel.compare_algo_combo.currentText())
+            else:
+                self.canvas.set_method_name(None)
+                if hasattr(self, 'canvas2'):
+                    self.canvas2.set_method_name(None)
+
             # 3D视角参数
             cam_angles = [
                 {'elevation': 30, 'azimuth': 45},   # 默认斜视角
@@ -5265,6 +5394,7 @@ class MainWindow(QMainWindow):
                 )
                 if gif_xlim is not None:
                     self.canvas.set_view_range(gif_xlim, gif_ylim)
+                QApplication.processEvents()
                 buf = self.canvas.get_frame_image()
                 frame_images.append(Image.open(buf).copy())
                 buf.close()
@@ -5283,50 +5413,70 @@ class MainWindow(QMainWindow):
                     )
                     if gif_xlim is not None:
                         self.canvas2.set_view_range(gif_xlim, gif_ylim)
+                    QApplication.processEvents()
                     buf = self.canvas2.get_frame_image()
                     frame_images.append(Image.open(buf).copy())
                     buf.close()
 
-                # 视图2和3：两个3D视角（主算法）
+                # 视图2和3：两个3D视角（主算法）——只绘制一次，切换相机角度捕获
+                self.canvas._current_layout = None
+                # 确保OpenGL上下文当前（grabFramebuffer可能改变了上下文状态）
+                try:
+                    self.canvas._gl_widget.makeCurrent()
+                except Exception:
+                    pass
+                self.canvas.draw_3d(
+                    trajectory=partial_traj,
+                    start_pos=start_pos,
+                    end_pos=end_pos,
+                    neb_images=neb_images,
+                    energy_profile=energy_profile,
+                    population_positions=population_positions,
+                )
                 for cam in cam_angles:
-                    self.canvas._current_layout = None
-                    self.canvas.draw_3d(
-                        trajectory=partial_traj,
-                        start_pos=start_pos,
-                        end_pos=end_pos,
-                        neb_images=neb_images,
-                        energy_profile=energy_profile,
-                        population_positions=population_positions,
-                    )
                     # 设置3D相机角度
                     try:
                         self.canvas._gl_widget.opts['elevation'] = cam['elevation']
                         self.canvas._gl_widget.opts['azimuth'] = cam['azimuth']
-                        self.canvas._gl_widget.update()
                     except Exception:
                         pass
+                    # 使用repaint强制同步重绘
+                    try:
+                        self.canvas._gl_widget.repaint()
+                    except Exception:
+                        self.canvas._gl_widget.update()
+                    QApplication.processEvents()
                     buf = self.canvas.get_frame_image()
                     frame_images.append(Image.open(buf).copy())
                     buf.close()
 
-                # 视图2b和3b：两个3D视角（对比算法，如果启用）
+                # 视图2b和3b：两个3D视角（对比算法，如果启用）——只绘制一次，切换相机角度捕获
                 if is_compare_mode:
+                    self.canvas2._current_layout = None
+                    # 确保OpenGL上下文当前
+                    try:
+                        self.canvas2._gl_widget.makeCurrent()
+                    except Exception:
+                        pass
+                    self.canvas2.draw_3d(
+                        trajectory=cmp_partial_traj,
+                        start_pos=start_pos,
+                        end_pos=end_pos,
+                        neb_images=cmp_neb_images,
+                        energy_profile=cmp_energy_profile,
+                        population_positions=cmp_pop_positions,
+                    )
                     for cam in cam_angles:
-                        self.canvas2._current_layout = None
-                        self.canvas2.draw_3d(
-                            trajectory=cmp_partial_traj,
-                            start_pos=start_pos,
-                            end_pos=end_pos,
-                            neb_images=cmp_neb_images,
-                            energy_profile=cmp_energy_profile,
-                            population_positions=cmp_pop_positions,
-                        )
                         try:
                             self.canvas2._gl_widget.opts['elevation'] = cam['elevation']
                             self.canvas2._gl_widget.opts['azimuth'] = cam['azimuth']
-                            self.canvas2._gl_widget.update()
                         except Exception:
                             pass
+                        try:
+                            self.canvas2._gl_widget.repaint()
+                        except Exception:
+                            self.canvas2._gl_widget.update()
+                        QApplication.processEvents()
                         buf = self.canvas2.get_frame_image()
                         frame_images.append(Image.open(buf).copy())
                         buf.close()
@@ -5451,6 +5601,25 @@ class MainWindow(QMainWindow):
                     partial_traj, start_pos, end_pos,
                     dimer_info, neb_images, energy_profile, pop_positions, **cmp_args)
                 images.append(combined)
+                # 更新进度
+                progress.setValue(int(i * 80 / max_frames))
+                QApplication.processEvents()
+                if progress.wasCanceled():
+                    # 恢复状态并退出
+                    self.canvas.mode = old_mode
+                    self.canvas._current_layout = None
+                    self.canvas._user_xlim = old_user_xlim
+                    self.canvas._user_ylim = old_user_ylim
+                    self.canvas._user_dist = old_user_dist
+                    self.canvas._restore_camera_state(old_cam_state)
+                    self.canvas.set_method_name(old_main_method)
+                    if hasattr(self, 'canvas2'):
+                        self.canvas2.set_method_name(old_cmp_method)
+                    self._update_view()
+                    return
+
+            progress.setValue(85)
+            QApplication.processEvents()
 
             # 恢复布局状态
             self.canvas.mode = old_mode
@@ -5460,12 +5629,19 @@ class MainWindow(QMainWindow):
             self.canvas._user_ylim = old_user_ylim
             self.canvas._user_dist = old_user_dist
             self.canvas._restore_camera_state(old_cam_state)
+            # 恢复方法名
+            self.canvas.set_method_name(old_main_method)
+            if hasattr(self, 'canvas2'):
+                self.canvas2.set_method_name(old_cmp_method)
             # 恢复偏置势状态
             if self.algorithm is not None and hasattr(self.algorithm, 'get_bias_function'):
                 self.canvas.set_bias_function(self.algorithm.get_bias_function())
             else:
                 self.canvas.set_bias_function(None)
             self._update_view()
+
+            progress.setValue(90)
+            QApplication.processEvents()
 
             if images:
                 images[0].save(
@@ -5477,8 +5653,10 @@ class MainWindow(QMainWindow):
                 )
                 for img in images:
                     img.close()
+                progress.setValue(100)
                 QMessageBox.information(self, "导出成功", f"GIF已保存到:\n{filepath}")
             else:
+                progress.setValue(100)
                 QMessageBox.warning(self, "导出失败", "没有可用的帧数据")
         except ImportError:
             QMessageBox.warning(
